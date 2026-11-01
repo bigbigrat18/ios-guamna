@@ -351,6 +351,68 @@ static void test_gic(void)
 
 #ifdef BOARD_GUAMNA
 /*
+ * Runs before anything touches the screen, so it works even when nothing
+ * is visible:
+ *  1. Restart reason = bootloader: any reset from here on (watchdog, crash,
+ *     our own) lands in FASTBOOT. Ending up in Android instead means the
+ *     shim never got control.
+ *  2. The APSS watchdog (qcom,wdt@f017000) is left running by ABL for Linux
+ *     to pet: pet it, then disable it.
+ *  3. Find what the display really scans out: the first MDSS source pipe
+ *     (DMA0, VIG0 of bengal's SDE) with a non-zero address; use its address,
+ *     stride, size and bytes per pixel for the console.
+ */
+#define WDT_BASE		0x0f017000UL	/* live FDT qcom,msm-watchdog */
+#define WDT_RST			0x04
+#define WDT_EN			0x08
+#define MDSS_BASE		0x05e00000UL	/* SDE: DSI ctrl is at +0x94000 in the live FDT */
+static uint32_t wdt_en_was, scan_pipe, scan_addr, scan_stride, scan_size, scan_fmt;
+
+static void guamna_early(void)
+{
+	stage = "imem";
+	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
+	__asm__ volatile("dsb sy" ::: "memory");
+	stage = "wdt";
+	wdt_en_was = rd32(WDT_BASE + WDT_EN);
+	wr32(WDT_BASE + WDT_RST, 1);
+	wr32(WDT_BASE + WDT_EN, 0);
+	__asm__ volatile("dsb sy" ::: "memory");
+	stage = "mdss";
+	static const uint32_t pipes[] = { 0x25000, 0x5000 };	/* DMA0, VIG0 */
+	for (unsigned i = 0; i < sizeof(pipes) / sizeof(pipes[0]); i++) {
+		uintptr_t p = MDSS_BASE + pipes[i];
+		uint32_t addr = rd32(p + 0x14);			/* SSPP_SRC0_ADDR */
+		if (!addr)
+			continue;
+		scan_pipe = pipes[i];
+		scan_addr = addr;
+		scan_size = rd32(p + 0x00);			/* SSPP_SRC_SIZE: h << 16 | w */
+		scan_stride = rd32(p + 0x24) & 0xffff;		/* SSPP_SRC_YSTRIDE0 */
+		scan_fmt = rd32(p + 0x30);			/* SSPP_SRC_FORMAT */
+		uint32_t w = scan_size & 0xffff, h = scan_size >> 16;
+		uint32_t bpp = ((scan_fmt >> 9) & 3) + 1;
+		if (w && h && scan_stride >= w * bpp && (bpp == 3 || bpp == 4)) {
+			con_fb = (volatile uint32_t *)(uintptr_t)addr;
+			con_w = w;
+			con_h = h;
+			con_stride = scan_stride;
+			con_bpp = bpp;
+		}
+		break;
+	}
+}
+
+static void report_early(void)
+{
+	con_hex2("WDT", "en_was=", wdt_en_was, "now=", rd32(WDT_BASE + WDT_EN));
+	con_hex2("SCANOUT", "pipe=", scan_pipe, "addr=", scan_addr);
+	con_hex2("SCANOUT", "size=", scan_size, "stride=", scan_stride);
+	con_hex2("SCANOUT", "fmt=", scan_fmt, "bpp=", con_bpp);
+	con_skip();
+}
+
+/*
  * First boot on a new board: answers what the XNU port assumes.
  *   TG16  0 = no 16K granule (expected on Cortex-A53: 4K-page kernel)
  *   ATOM  ID_AA64ISAR0 atomics, 0 = no LSE (expected: ARMv8.0)
@@ -415,11 +477,17 @@ void shim_main(uint64_t dtb)
 {
 	struct mmu_info mi;
 
+#ifdef BOARD_GUAMNA
+	guamna_early();
+#endif
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_clear(RED);
 	con_str("SHIM", "sweet milestone 4: xnu loader");
 	con_skip();
+#ifdef BOARD_GUAMNA
+	report_early();
+#endif
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();

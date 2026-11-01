@@ -16,16 +16,29 @@
 #define LABEL_COLS	8
 
 volatile uint32_t *con_fb = (volatile uint32_t *)FB_BASE;
+uint32_t con_w = FB_W, con_h = FB_H, con_stride = FB_STRIDE, con_bpp = 4;
 static uint32_t con_bg;
 static int row;
 
+/* One pixel; 3 bytes per pixel (RGB888 scanout) is written bytewise. */
+static inline void put_px(uint32_t x, uint32_t y, uint32_t c)
+{
+	uintptr_t a = (uintptr_t)con_fb + (uintptr_t)y * con_stride + (uintptr_t)x * con_bpp;
+	if (con_bpp == 4) {
+		*(volatile uint32_t *)a = c;
+	} else {
+		volatile uint8_t *p = (volatile uint8_t *)a;
+		p[0] = (uint8_t)c;
+		p[1] = (uint8_t)(c >> 8);
+		p[2] = (uint8_t)(c >> 16);
+	}
+}
+
 void con_clear(uint32_t bg)
 {
-	for (int y = 0; y < FB_H; y++) {
-		volatile uint32_t *line = con_fb + y * (FB_STRIDE / 4);
-		for (int x = 0; x < FB_W; x++)
-			line[x] = bg;
-	}
+	for (uint32_t y = 0; y < con_h; y++)
+		for (uint32_t x = 0; x < con_w; x++)
+			put_px(x, y, bg);
 	con_bg = bg;
 	row = 0;
 }
@@ -36,17 +49,14 @@ static void put_char(int col, char ch, uint32_t fg)
 		ch = '?';
 	const unsigned char *g = font8x16[ch - 0x20];
 	int x0 = MARGIN + col * CH_W, y0 = MARGIN + row * CH_H;
-	if (x0 + CH_W > FB_W || y0 + CH_H > FB_H)
+	if ((uint32_t)(x0 + CH_W) > con_w || (uint32_t)(y0 + CH_H) > con_h)
 		return;
 	for (int gy = 0; gy < 16; gy++)
 		for (int gx = 0; gx < 8; gx++) {
 			uint32_t c = (g[gy] & (0x80 >> gx)) ? fg : con_bg;
-			for (int sy = 0; sy < SCALE; sy++) {
-				volatile uint32_t *p = con_fb + (y0 + gy * SCALE + sy) * (FB_STRIDE / 4)
-						       + x0 + gx * SCALE;
+			for (int sy = 0; sy < SCALE; sy++)
 				for (int sx = 0; sx < SCALE; sx++)
-					p[sx] = c;
-			}
+					put_px(x0 + gx * SCALE + sx, y0 + gy * SCALE + sy, c);
 		}
 }
 
