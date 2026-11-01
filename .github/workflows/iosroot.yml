@@ -1,0 +1,191 @@
+name: iosroot
+
+# iOS 16.7.16 (20H392) iPhone X userland for guamna, built in CI:
+#   1. ISA check: does the userland use instructions guamna's Cortex-A53/A73
+#      (ARMv8.0) cannot execute? Report only (step summary + lse-report).
+#   2. HFS+ root image (tools/mkiosroot.sh + tools/sweet-root-tweaks.py) as a
+#      sparse image for `fastboot flash userdata`.
+#   3. d22ap.adt (the real iPhone X device tree, for mkadt's /product node).
+# The image and d22ap.adt are Apple files: artifacts expire after 3 days, and
+# on a public repo every logged-in GitHub user can download them meanwhile.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_root:
+        description: Build the root image (off = ISA check and d22ap.adt only)
+        type: boolean
+        default: true
+      size:
+        description: HFS+ image size (must fit guamna's userdata)
+        default: 16G
+
+permissions:
+  contents: read
+
+jobs:
+  root:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      IPSW_URL: https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw
+      IPSW_SHA256: ece1194f7e233e9109c5790a8d23a4564a10a254e15ec5b09978a343265568fb
+      IPSW_TOOL: v3.1.720
+      APFS_FUSE_SHA: 66b86bd525e8cb90f9012543be89b1f092b75cf3
+      W: /mnt/work
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Disk (work on /mnt)
+        run: |
+          sudo mkdir -p "$W" && sudo chown "$USER" "$W"
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL &
+          df -h / /mnt
+
+      - name: Tools (hfsprogs, apfs-fuse, ipsw, libsparse)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq hfsprogs rsync fuse3 libfuse3-dev libbz2-dev zlib1g-dev libattr1-dev \
+            cmake g++ android-sdk-libsparse-utils unzip
+          sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)" || true
+          sudo modprobe hfsplus
+          git clone -q https://github.com/sgan81/apfs-fuse "$W/apfs-fuse"
+          git -C "$W/apfs-fuse" checkout -q "$APFS_FUSE_SHA"
+          git -C "$W/apfs-fuse" submodule update -q --init
+          cmake -S "$W/apfs-fuse" -B "$W/apfs-fuse/build" -DCMAKE_BUILD_TYPE=Release > /dev/null
+          make -C "$W/apfs-fuse/build" -j"$(nproc)" > /dev/null
+          sudo install "$W/apfs-fuse/build/apfs-fuse" /usr/local/bin/
+          mkdir -p "$W/ipsw-tool"
+          curl -fsSL "https://github.com/blacktop/ipsw/releases/download/$IPSW_TOOL/ipsw_${IPSW_TOOL#v}_linux_x86_64.tar.gz" \
+            | tar xz -C "$W/ipsw-tool"
+          sudo install "$(find "$W/ipsw-tool" -type f -name ipsw | head -1)" /usr/local/bin/ipsw
+          apfs-fuse 2>&1 | head -2 || true
+          ipsw version
+
+      - name: Download IPSW (6.2 GB, SHA-256 checked)
+        run: |
+          curl -fL --retry 3 --retry-delay 10 -o "$W/fw.ipsw" "$IPSW_URL"
+          echo "$IPSW_SHA256  $W/fw.ipsw" | sha256sum -c -
+
+      - name: Extract OS, cryptexes and the D22AP device tree
+        run: |
+          unzip -p "$W/fw.ipsw" BuildManifest.plist > "$W/BuildManifest.plist"
+          python3 - "$W/BuildManifest.plist" > "$W/members.env" <<'EOF'
+          import plistlib, sys
+          bm = plistlib.load(open(sys.argv[1], 'rb'))
+          ids = [i for i in bm['BuildIdentities'] if i['Info'].get('DeviceClass', '').lower() == 'd22ap']
+          ident = next((i for i in ids if 'Erase' in i['Info'].get('RestoreBehavior', '')), ids[0])
+          m = ident['Manifest']
+          print(f"OS={m['OS']['Info']['Path']}")
+          print(f"SYSOS={m['Cryptex1,SystemOS']['Info']['Path']}")
+          print(f"APPOS={m['Cryptex1,AppOS']['Info']['Path']}")
+          print(f"DT={m['DeviceTree']['Info']['Path']}")
+          EOF
+          cat "$W/members.env"
+          . "$W/members.env"
+          mkdir -p "$W/x"
+          unzip -q -o "$W/fw.ipsw" "$OS" "$SYSOS" "$APPOS" "$DT" -d "$W/x"
+          rm "$W/fw.ipsw"
+          cat "$W/members.env" >> "$GITHUB_ENV"
+          ipsw img4 im4p extract "$W/x/$DT" -o "$W/d22ap.adt"
+          ls -l "$W/x" "$W/d22ap.adt"
+          df -h /mnt
+
+      - name: ISA check (instructions the A53/A73 cannot run)
+        continue-on-error: true
+        run: |
+          mkdir -p "$W/sysos-mnt" "$W/os-mnt" lse-report
+          ln -s "$W/x/$SYSOS" "$W/sysos.dmg"
+          ln -s "$W/x/$OS" "$W/os.dmg"
+          sudo apfs-fuse -o allow_other "$W/sysos.dmg" "$W/sysos-mnt"
+          sudo apfs-fuse -o allow_other "$W/os.dmg" "$W/os-mnt"
+          dsc=$(sudo find "$W/sysos-mnt/root/System/Library/Caches/com.apple.dyld" -name 'dyld_shared_cache_arm64*' ! -name '*.*' | head -1)
+          echo "shared cache: $dsc"
+          sudo cp "$dsc"* "$W/" 2>/dev/null; sudo chown "$USER" "$W"/dyld_shared_cache_arm64*
+          sudo cp "$W/os-mnt/root/usr/lib/dyld" "$W/dyld" && sudo chown "$USER" "$W/dyld"
+          sudo umount "$W/sysos-mnt" "$W/os-mnt"
+          python3 - "$W" <<'EOF' | tee lse-report/report.md >> "$GITHUB_STEP_SUMMARY"
+          import re, subprocess, sys
+          w = sys.argv[1]
+          dsc = f'{w}/dyld_shared_cache_arm64'
+          cats = {
+            'LSE atomics (v8.1)': r'\b(cas(p)?(a|al|l)?[bh]?|ld(add|clr|eor|set|smax|smin|umax|umin)(a|al|l)?[bh]?|st(add|clr|eor|set|smax|smin|umax|umin)l?[bh]?|swp(a|al|l)?[bh]?)\b',
+            'RDM (v8.1)': r'\bsqrdml[as]h\b',
+            'RCpc LDAPR (v8.3)': r'\bldap(u)?r[bh]?\b',
+            'FP16 arithmetic (v8.2)': r'\bf(add|sub|mul|div|madd|msub|nmul|abs|neg|sqrt|max|min|maxnm|minnm|cmp|cmpe|ccmp|csel|cvtzs|cvtzu|rint[a-z]?)\s+h\d|\.[48]h\b.*\bf[a-z]+\b|\bf[a-z]+\b.*\.[48]h\b',
+            'Dot product (v8.2+)': r'\b[su]dot\b',
+            'FJCVTZS (v8.3)': r'\bfjcvtzs\b',
+          }
+          ansi = re.compile(r'\x1b\[[0-9;]*m')
+          images = ['libsystem_kernel.dylib', 'libsystem_platform.dylib', 'libsystem_pthread.dylib',
+                    'libsystem_malloc.dylib', 'libsystem_c.dylib', 'libdispatch.dylib', 'libobjc.A.dylib',
+                    'libc++.1.dylib', 'libc++abi.dylib', 'CoreFoundation', 'Foundation', 'libxpc.dylib',
+                    'QuartzCore', 'BackBoardServices', 'FrontBoardServices', 'SpringBoardFoundation']
+          def scan(cmd):
+              p = subprocess.run(cmd, capture_output=True, text=True)
+              out = ansi.sub('', p.stdout)
+              lines = [l for l in out.splitlines() if re.match(r'\s*0x[0-9a-f]+', l, re.I)]
+              res = {}
+              for c, rx in cats.items():
+                  r = re.compile(rx, re.I)
+                  hits = [l.strip() for l in lines if r.search(l.split(':', 1)[-1] if ':' in l else l)]
+                  res[c] = hits
+              return len(lines), res, p.returncode, p.stderr[-300:]
+          print('# iOS 16.7.16 (iPhone10,3) userland vs ARMv8.0 (guamna)\n')
+          print('| image | instructions | ' + ' | '.join(cats) + ' |')
+          print('|---|---|' + '---|' * len(cats))
+          examples = []
+          targets = [('/usr/lib/dyld', ['ipsw', 'macho', 'disass', f'{w}/dyld', '--all'])]
+          targets += [(img, ['ipsw', 'dyld', 'disass', dsc, '--image', img]) for img in images]
+          for name, cmd in targets:
+              n, res, rc, err = scan(cmd)
+              if n == 0:
+                  print(f'| {name} | **disassembly failed** (rc {rc}: {err.strip()[:120]}) |' + ' |' * len(cats))
+                  continue
+              print(f'| {name} | {n} | ' + ' | '.join(str(len(h)) for h in res.values()) + ' |')
+              for c, h in res.items():
+                  examples += [(name, c, x) for x in h[:3]]
+          print('\n## First examples\n```')
+          for name, c, x in examples[:60]:
+              print(f'{name:28} {c:24} {x[:110]}')
+          print('```')
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lse-report
+          path: lse-report/
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: d22ap-adt
+          path: /mnt/work/d22ap.adt
+          retention-days: 3
+
+      - name: Build HFS+ root (mkiosroot.sh + sweet-root-tweaks.py)
+        if: inputs.build_root
+        run: |
+          rm -f "$W"/dyld_shared_cache_arm64* "$W/dyld"
+          tools/mkiosroot.sh "$W/x/$OS" "$W/x/$SYSOS" "$W/x/$APPOS" "$W/ios16-root.img" "${{ inputs.size }}"
+          rm -rf "$W/x"
+          sudo fsck.hfsplus -fy "$W/ios16-root.img" | tail -3
+          sudo mkdir -p /mnt/iosroot
+          sudo mount -t hfsplus -o loop,force "$W/ios16-root.img" /mnt/iosroot
+          sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
+          df -h /mnt/iosroot
+          sudo umount /mnt/iosroot
+          sudo fsck.hfsplus -fn "$W/ios16-root.img" | tail -3
+          img2simg "$W/ios16-root.img" "$W/ios16-root.simg"
+          rm "$W/ios16-root.img"
+          ls -l "$W/ios16-root.simg"
+          sha256sum "$W/ios16-root.simg"
+
+      - uses: actions/upload-artifact@v4
+        if: inputs.build_root
+        with:
+          name: ios16-root-simg
+          path: /mnt/work/ios16-root.simg
+          retention-days: 3
+          compression-level: 1
