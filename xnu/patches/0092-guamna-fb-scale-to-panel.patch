@@ -1,0 +1,155 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..a97f057 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -77,6 +77,11 @@ enum {
+  * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
+  * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+  * Boot-arg sweetfb_native=1 presents the real panel size instead.
++ *
++ * GUAMNA (720x1600 panel): the centered crop would hide the status bar,
++ * clock and dock, so the whole 1125x2436 canvas is scaled down to fit
++ * (nearest neighbour, aspect kept: 720x1559, black bars of 20 rows above and
++ * below). Boot-arg sweetfb_scale=0 brings back the crop, =1 forces scaling.
+  */
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
+@@ -104,6 +109,12 @@ public:
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	bool          fScaled;                  /* canvas scaled down to the panel */
++	int32_t      *fXMap;                    /* panel x -> logical x */
++	int32_t      *fYMap;                    /* panel y -> logical y, -1 = bar */
++	bool          fBarsCleared;
++	void          presentScaled(SweetSurface *s, int32_t sx, int32_t sy,
++	    int32_t dx, int32_t dy, int32_t w, int32_t h);
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -176,6 +187,45 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++#if defined(ARM64_BOARD_CONFIG_GUAMNA)
++	int scale = 1;
++#else
++	int scale = 0;
++#endif
++	PE_parse_boot_argn("sweetfb_scale", &scale, sizeof(scale));
++	if (scale && (fLogicalW > fWidth || fLogicalH > fHeight)) {
++		/* fit: s = min(fWidth / fLogicalW, fHeight / fLogicalH), as fractions */
++		uint64_t outW, outH;
++		if ((uint64_t)fWidth * fLogicalH <= (uint64_t)fHeight * fLogicalW) {
++			outW = fWidth;
++			outH = (uint64_t)fLogicalH * fWidth / fLogicalW;
++		} else {
++			outH = fHeight;
++			outW = (uint64_t)fLogicalW * fHeight / fLogicalH;
++		}
++		uint32_t padX = (uint32_t)((fWidth - outW) / 2), padY = (uint32_t)((fHeight - outH) / 2);
++		fXMap = (int32_t *)IOMallocData(fWidth * sizeof(int32_t));
++		fYMap = (int32_t *)IOMallocData(fHeight * sizeof(int32_t));
++		if (fXMap != NULL && fYMap != NULL) {
++			for (uint32_t x = 0; x < fWidth; x++) {
++				fXMap[x] = (x < padX || x >= padX + outW) ? -1 :
++				    (int32_t)(((uint64_t)(x - padX) * fLogicalW + fLogicalW / 2) / outW);
++				if (fXMap[x] >= (int32_t)fLogicalW) {
++					fXMap[x] = (int32_t)fLogicalW - 1;
++				}
++			}
++			for (uint32_t y = 0; y < fHeight; y++) {
++				fYMap[y] = (y < padY || y >= padY + outH) ? -1 :
++				    (int32_t)(((uint64_t)(y - padY) * fLogicalH + fLogicalH / 2) / outH);
++				if (fYMap[y] >= (int32_t)fLogicalH) {
++					fYMap[y] = (int32_t)fLogicalH - 1;
++				}
++			}
++			fScaled = true;
++			IOLog("SWEET FB: %ux%u canvas scaled to %llux%llu at %u,%u\n",
++			    fLogicalW, fLogicalH, outW, outH, padX, padY);
++		}
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -359,6 +409,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++		if (fScaled) {
++			presentScaled(s, sx, sy, dx, dy, w, h);
++			s->release();
++			continue;
++		}
+ 		/* Logical (presented) display coordinates -> panel coordinates. */
+ 		dx -= fOffX;
+ 		dy -= fOffY;
+@@ -401,6 +456,67 @@ AppleCLCD::present(const uint8_t *rec)
+ 	}
+ }
+ 
++/*
++ * One layer, scaled: every panel pixel whose logical position falls inside
++ * the layer's destination rect takes the nearest source pixel.
++ */
++void
++AppleCLCD::presentScaled(SweetSurface *s, int32_t sx, int32_t sy, int32_t dx, int32_t dy,
++    int32_t w, int32_t h)
++{
++	uintptr_t src = s->kernelAddress();
++	uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++
++	if (!fBarsCleared) {
++		for (uint32_t y = 0; y < fHeight; y++) {
++			uint32_t *row = (uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
++			for (uint32_t x = 0; x < fWidth; x++) {
++				if (fYMap[y] < 0 || fXMap[x] < 0) {
++					row[x] = 0;
++				}
++			}
++		}
++		fBarsCleared = true;
++	}
++	if (w > (int32_t)s->width - sx) {
++		w = (int32_t)s->width - sx;
++	}
++	if (h > (int32_t)s->height - sy) {
++		h = (int32_t)s->height - sy;
++	}
++	if (src == 0 || bpe != 4 || w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
++	    s->memory == NULL ||
++	    (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow + (uint64_t)(sx + w) * 4 >
++	    s->memory->getLength()) {
++		return;
++	}
++	/* panel column range covered by [dx, dx + w) */
++	uint32_t x0 = fWidth, x1 = 0;
++	for (uint32_t x = 0; x < fWidth; x++) {
++		if (fXMap[x] >= dx && fXMap[x] < dx + w) {
++			if (x < x0) {
++				x0 = x;
++			}
++			x1 = x + 1;
++		}
++	}
++	if (x0 >= x1) {
++		return;
++	}
++	for (uint32_t y = 0; y < fHeight; y++) {
++		int32_t ly = fYMap[y];
++		if (ly < dy || ly >= dy + h) {
++			continue;
++		}
++		const uint32_t *srow = (const uint32_t *)(src + s->offset +
++		    (uint64_t)(sy + ly - dy) * s->bytesPerRow) + sx - dx;
++		uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)y * fRowBytes);
++		for (uint32_t x = x0; x < x1; x++) {
++			drow[x] = srow[fXMap[x]];
++		}
++	}
++}
++
+ bool
+ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
