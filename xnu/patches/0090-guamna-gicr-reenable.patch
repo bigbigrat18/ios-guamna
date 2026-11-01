@@ -1,0 +1,67 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 257c7bd..5f24b72 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -23,6 +23,7 @@ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ #if defined(GUAMNA)
+ extern "C" void sweet_gic_diag(void);
+ extern "C" void sweet_gic_diag_str(char *buf, unsigned long len);
++extern "C" void sweet_gicr_reenable(void);
+ #endif
+ 
+ class SweetCPU;
+@@ -233,6 +234,9 @@ SweetCPU::initCPU(bool boot)
+ 	assert(cpu_number() == (int)getCPUNumber());
+ 
+ 	ml_broadcast_cpu_event(CPU_BOOTED, getCPUNumber());
++#if defined(GUAMNA)
++	sweet_gicr_reenable();
++#endif
+ 
+ 	/* Secondary startup runs at splsched: queue the self-IPI and return.
+ 	 * startAll waits for its delivery after the startup thread unmasks IRQs.
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index fd5e1fe..227774e 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -90,6 +90,27 @@ sweet_gic_diag_str(char *buf, unsigned long len)
+ 	    __builtin_arm_rsr64("ICC_CTLR_EL1"), __builtin_arm_rsr64("CNTV_CTL_EL0"));
+ }
+ 
++/*
++ * Bring-up: the boot CPU's redistributor reads enable/priority 0 by the time
++ * SweetCPU starts it (phone, 0089), so the self-SGI and the timer stay
++ * pending forever. Re-apply the per-CPU configuration and report.
++ */
++void sweet_gicr_reenable(void);
++void
++sweet_gicr_reenable(void)
++{
++	vm_offset_t gicr_pe_base = find_gicr_pe_base();
++	uint32_t before = gicr_read32(GICR_ISENABLER0);
++	gicr_write32(GICR_IGROUPR0, 0xFFFFFFFF);
++	for (unsigned int i = 0; i < 32; i += 4) {
++		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
++	}
++	gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++	__builtin_arm_dsb(DSB_SY);
++	kprintf("SWEET GIC: re-enable cpu=%d isen0 0x%x -> 0x%x prio16_19=0x%x\n", ml_get_cpu_number_local(),
++	    before, gicr_read32(GICR_ISENABLER0), gicr_read32(GICR_IPRIORITYR0 + 16));
++}
++
+ /* Bring-up: everything that decides whether the virtual timer IRQ reaches us. */
+ void sweet_gic_diag(void);
+ void
+@@ -210,6 +231,12 @@ pe_init_fiq()
+ 		gicr_write32(GICR_IPRIORITYR0 + i, 0xA0A0A0A0);
+ 	}
+ 	gicr_write32(GICR_ISENABLER0, (1U << sweet_vtimer_intid) | (1U << SWEET_IPI_SGI));
++#if defined(GUAMNA)
++	__builtin_arm_dsb(DSB_SY);
++	kprintf("SWEET GIC: after init cpu=%d gicr=%p isen0=0x%x prio16_19=0x%x grp0=0x%x waker=0x%x\n",
++	    ml_get_cpu_number_local(), (void *)gicr_pe_base, gicr_read32(GICR_ISENABLER0),
++	    gicr_read32(GICR_IPRIORITYR0 + 16), gicr_read32(GICR_IGROUPR0), gicr_read32(GICR_WAKER));
++#endif
+ #else
+ 	// Configure timers and legacy FIQ to be group 0
+ 	gicr_write32(GICR_IGROUPR0, 0x81FFFFFF);
