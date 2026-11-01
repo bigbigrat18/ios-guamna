@@ -68,9 +68,8 @@ jobs:
           if [ "$MACHINE_CONFIG" = GUAMNA ]; then
             # xcodebuild compiles libfirehose_kernel for arm64-apple-macos, i.e.
             # Apple clang's apple-m1 default CPU: LSE atomics and LDAPR, which
-            # are UNDEFINED on guamna's A53/A73. Pin its arm64 slice like the kernel.
-            sed -i '' 's/VALID_ARCHS="x86_64 arm64e arm64"/VALID_ARCHS="x86_64 arm64e arm64" "OTHER_CFLAGS[arch=arm64]=\\$(inherited) -mcpu=cortex-a53"/' dxb/build.sh
-            grep -c 'OTHER_CFLAGS\[arch=arm64\]=\\$(inherited) -mcpu=cortex-a53' dxb/build.sh
+            # are UNDEFINED on guamna's A53/A73. Pin its arm64 slice like the kernel (see the script).
+            python3 .github/scripts/guamna-firehose-cpu.py dxb/build.sh
           fi
           ls dxb/patches
 
