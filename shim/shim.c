@@ -12,12 +12,19 @@
 #include "loader.h"
 #include "ufs.h"
 
+#ifdef BOARD_GUAMNA
+/* SM4250: GIC from mainline sm6115.dtsi (UNVERIFIED). IMEM restart reason and
+ * PS_HOLD are unknown: reset() uses PSCI SYSTEM_RESET only. */
+#define GICD_BASE		0x0f200000UL
+#define GICR_BASE		0x0f300000UL
+#else
 #define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
 #define PSHOLD			0x0c264000UL
 
 #define GICD_BASE		0x17a00000UL
 #define GICR_BASE		0x17a60000UL
+#endif
 #define GICR_SIZE		0x100000UL
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
@@ -106,10 +113,14 @@ static void __attribute__((noreturn)) reset(unsigned after_s)
 	con_skip();
 	con_str("RESET", after_s > 20 ? "in 40s" : "in 20s");
 	delay_ms(after_s * 1000);
+#ifndef BOARD_GUAMNA
 	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
+#endif
 	__asm__ volatile("dsb sy" ::: "memory");
 	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
+#ifndef BOARD_GUAMNA
 	wr32(PSHOLD, 0);
+#endif
 	for (;;)
 		__asm__ volatile("wfe");
 }
@@ -340,6 +351,38 @@ static void test_gic(void)
 	isb();
 }
 
+#ifdef BOARD_GUAMNA
+/*
+ * First boot on a new board: answers what the XNU port assumes.
+ *   TG16  0 = no 16K granule (expected on Cortex-A53: 4K-page kernel)
+ *   ATOM  ID_AA64ISAR0 atomics, 0 = no LSE (expected: ARMv8.0)
+ *   PAN   ID_AA64MMFR1 PAN, 0 = none (expected)
+ *   EL    1 or 2: where ABL hands over
+ * Every probe sets `stage`, so a fault paints which one hung.
+ */
+static void probe_board(void)
+{
+	stage = "probe cpu";
+	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1"), isar0 = rsr("id_aa64isar0_el1");
+	uint64_t mmfr1 = rsr("id_aa64mmfr1_el1");
+	con_hex2("MIDR", "midr=", rsr("midr_el1"), "mpidr=", rsr("mpidr_el1"));
+	con_hex2("EL", "el=", rsr("CurrentEL") >> 2, "cntfrq=", rsr("cntfrq_el0"));
+	con_hex2("MMFR0", "tg16=", (mmfr0 >> 20) & 0xf, "parange=", mmfr0 & 0xf);
+	con_hex2("ISAR0", "atom=", (isar0 >> 20) & 0xf, "aes=", (isar0 >> 4) & 0xf);
+	con_hex2("MMFR1", "pan=", (mmfr1 >> 20) & 0xf, "vh=", (mmfr1 >> 8) & 0xf);
+	con_skip();
+	stage = "probe psci";
+	con_hex2("PSCI", "ver=", smc(PSCI_VERSION, 0, 0, 0), "smccc=", smc(SMCCC_VERSION, 0, 0, 0));
+	con_hex2("PSCI ON", "feat=", smc(PSCI_FEATURES, PSCI_CPU_ON, 0, 0), "reset=",
+		 smc(PSCI_FEATURES, PSCI_SYSTEM_RESET, 0, 0));
+	stage = "probe gicd";
+	con_hex2("GICD", "ctlr=", rd32(GICD_BASE), "typer=", rd32(GICD_BASE + 4));
+	con_hex2("GICD", "iidr=", rd32(GICD_BASE + 8), "pidr2=", rd32(GICD_BASE + 0xffe8));
+	stage = "probe gicr";
+	con_hex2("GICR0", "typer=", rd32(GICR_BASE + GICR_TYPER), "typer_hi=", rd32(GICR_BASE + GICR_TYPER + 4));
+}
+#endif
+
 /* ---- main ---- */
 
 static void __attribute__((unused)) psci_line(const char *label, uint64_t fn)
@@ -383,12 +426,19 @@ void shim_main(uint64_t dtb)
 	con_str("LOADER", why);
 	con_skip();
 
+#ifdef BOARD_GUAMNA
+	/* No payload: report what the guamna port assumes (MMU still off). */
+	probe_board();
+	con_skip();
+	con_str("PROBE", "done, reset in ~3 min");
+#else
 	/* No payload: probe the internal UFS while the MMU is still off. */
 	stage = "ufs";
 	test_ufs();
 	con_skip();
 	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
 	con_str("UFS", "probe done, reset in ~3 min");
+#endif
 	delay_ms(180000);
 	reset(20);
 

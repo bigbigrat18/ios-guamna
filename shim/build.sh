@@ -5,6 +5,13 @@ cd "$(dirname "$0")"
 CC=aarch64-linux-gnu-gcc
 OBJCOPY=aarch64-linux-gnu-objcopy
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -Wall -Wextra"
+# BOARD=guamna: Moto G Play 2021 (SM4250, Cortex-A53/A73). Default: sweet.
+BOARD=${BOARD:-sweet}
+case "$BOARD" in
+	sweet) ;;
+	guamna) CFLAGS="$CFLAGS -DBOARD_GUAMNA -mcpu=cortex-a53" ;;
+	*) echo "error: unknown BOARD=$BOARD (sweet, guamna)" >&2; exit 1 ;;
+esac
 mkdir -p out
 for f in start.S shim.c console.c mmu.c fdt.c loader.c ufs.c; do
 	$CC $CFLAGS -c $f -o out/${f%.*}.o
@@ -32,5 +39,5 @@ mkbootimg --header_version 2 --kernel out/Image --ramdisk out/ramdisk.bin \
 	--os_version 17.0.0 --os_patch_level 2035-06 \
 	--cmdline "console=null" -o out/shim-boot.img
 # Host render of the console layout.
-gcc -O1 -Wall -o out/host_test console.c host_test.c && ./out/host_test
+gcc -O1 -Wall $([ "$BOARD" = guamna ] && echo -DBOARD_GUAMNA) -o out/host_test console.c host_test.c && ./out/host_test
 ls -l out/Image out/shim-boot.img

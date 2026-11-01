@@ -1,0 +1,646 @@
+diff --git a/bsd/conf/Makefile.template b/bsd/conf/Makefile.template
+index f2d8bf8..3ef31a1 100644
+--- a/bsd/conf/Makefile.template
++++ b/bsd/conf/Makefile.template
+@@ -45,7 +45,7 @@ CFLAGS+= -include meta_features.h -DDRIVER_PRIVATE \
+ SFLAGS+= -include meta_features.h
+ 
+ # This provider is built into SWEET; other boards use their normal kext.
+-ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
++ifneq ($(filter SWEET GUAMNA,$(CURRENT_MACHINE_CONFIG)),)
+ SWEET_PTHREAD_ROOT = $(SRCROOT)/bsd/pthread/sweet_libpthread
+ SWEET_PTHREAD_INC = -I$(SWEET_PTHREAD_ROOT) -I$(SWEET_PTHREAD_ROOT)/private -I$(SWEET_PTHREAD_ROOT)/include
+ sweet_pthread_init.o_INCFLAGS = $(SWEET_PTHREAD_INC)
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..e2a137f 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/guamna_stubs.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/guamna_stubs.c b/bsd/dev/guamna_stubs.c
+new file mode 100644
+index 0000000..38a9fa7
+--- /dev/null
++++ b/bsd/dev/guamna_stubs.c
+@@ -0,0 +1,51 @@
++/*
++ * GUAMNA: link stubs for the sweet (SM7150) hardware drivers that are
++ * compiled out on guamna (sweet_ufs.c, sweet_spmi.c, sweet_keys.c,
++ * sweet_touch.c, sweet_rpmh.c, sweet_usb.c all poke fixed SM7150 MMIO).
++ * Each stub reports "no such device" so the shared callers fall back:
++ *   - IOKitBSDInit rd=ufsroot0     -> panics with a clear message
++ *   - SweetBattery                 -> static 100 % power source
++ *   - serial_console               -> no persistent log until a storage
++ *                                     driver provides one (patch 0083)
++ * Boot guamna with a RAM-disk root (rd=md0) until patch 0083's eMMC
++ * driver is in place.
++ */
++#if defined(ARM64_BOARD_CONFIG_GUAMNA)
++#include <sys/param.h>
++#include <sys/errno.h>
++#include <sys/types.h>
++#include <pexpert/arm64/board_config.h>
++
++int sweet_ufs_rootdev(dev_t *dev);
++int sweet_spmi_init(void);
++int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++
++int
++sweet_ufs_rootdev(__unused dev_t *dev)
++{
++	return ENXIO;
++}
++
++/* TODO guamna: PM6125/PMI632 behind bengal's SPMI arbiter (ADT /guamna-spmi). */
++int
++sweet_spmi_init(void)
++{
++	return ENXIO;
++}
++
++int
++sweet_spmi_read(__unused unsigned sid, __unused unsigned addr, __unused uint8_t *out)
++{
++	return ENXIO;
++}
++
++#if !GUAMNA_EMMC
++/* Replaced by the persistent log in bsd/dev/guamna_emmc.c (patch 0083). */
++void sweet_log_append(const char *c, int size);
++
++void
++sweet_log_append(__unused const char *c, __unused int size)
++{
++}
++#endif /* !GUAMNA_EMMC */
++#endif /* ARM64_BOARD_CONFIG_GUAMNA */
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index a148608..d2703c7 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -4,7 +4,7 @@
+  * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+  * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
+  */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) && !defined(ARM64_BOARD_CONFIG_GUAMNA)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 4da50d8..c17a899 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -3,7 +3,7 @@
+  * Sole XNU apps-DRV owner, called from thread context with deep idle disabled.
+  * No sleep/wake programming, SPMI writes, GIC handler, or timeout recovery.
+  */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) && !defined(ARM64_BOARD_CONFIG_GUAMNA)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1981490..bd02ccc 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -5,7 +5,7 @@
+  * Init is serialized by the single built-in SweetBattery personality.
+  * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
+  */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) && !defined(ARM64_BOARD_CONFIG_GUAMNA)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 03defe6..daf3636 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -5,7 +5,7 @@
+  * No firmware/config upload or direct PMIC writes. Only IC data write:
+  * zero to GT9896's event status after reading a report. See touch2/report.md.
+  */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) && !defined(ARM64_BOARD_CONFIG_GUAMNA)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..d981aea 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -18,7 +18,7 @@
+  * against the partition bounds again right before it is issued, so nothing
+  * outside the named partition can be written.
+  */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) && !defined(ARM64_BOARD_CONFIG_GUAMNA)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/buf.h>
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index b6c1a41..6cf9875 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -10,7 +10,7 @@
+  * DWC3 / PHY register blocks only when the GCC status registers say their
+  * power domain and clocks are on (an access to a gated block would hang).
+  */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) && !defined(ARM64_BOARD_CONFIG_GUAMNA)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+diff --git a/config/MASTER.arm64.guamna b/config/MASTER.arm64.guamna
+new file mode 100644
+index 0000000..95b1ef6
+--- /dev/null
++++ b/config/MASTER.arm64.guamna
+@@ -0,0 +1,117 @@
++#
++# guamna (Moto G Play 2021, SM4250): identical to MASTER.arm64.sweet; doconf picks
++# MASTER.arm64.<machine config, lower case>. Keep the two in sync.
++# sweet (Redmi Note 10 Pro, SM7150): MASTER.arm64.MacOSX plus the open-source
++# arm64 assembly and pmap (nos_arm_asm, nos_arm_pmap). Apple's own SoC configs
++# link those from the KDK's closed lib<SOC>.os.<CONFIG>.a instead, which is
++# arm64e and Apple-silicon specific. kperf/kpc stay (xnu does not build without
++# kperf); osfmk/arm64/kpc.c is a stub with no hardware counters.
++#
++#
++# Mach Operating System
++# Copyright (c) 1986 Carnegie-Mellon University
++# Copyright 2001-2018 Apple Inc.
++#
++# All rights reserved.  The CMU software License Agreement
++# specifies the terms and conditions for use and redistribution.
++#  
++######################################################################
++#
++#  Master Apple configuration file (see the master machine independent
++#  configuration file for a description of the file format).
++#
++######################################################################
++#  
++#  Standard Apple OS Configurations:
++#  -------- ----- -- ---------------
++#
++#  KERNEL_BASE =    [ arm64 config_pmap_ppl medium msgb_large config_requires_u32_munging config_delay_idle_sleep config_proc_udata_storage config_uexc config_darkboot nos_arm_asm nos_arm_pmap ]
++#  KERNEL_RELEASE = [ KERNEL_BASE ]
++#  KERNEL_DEV =     [ KERNEL_BASE development mach_assert config_xnupost proc_ref_debug config_proc_resource_limits ]
++#  KERNEL_DEBUG =   [ KERNEL_BASE debug mach_assert config_xnupost config_waitq_stats config_workloop_debug config_proc_resource_limits ]
++#  BSD_BASE =       [ mach_bsd sysv_sem sysv_msg sysv_shm config_netboot config_imageboot psynch config_proc_uuid_policy config_coredump pgo config_personas ]
++#  BSD_RELEASE =    [ BSD_BASE ]
++#  BSD_DEV =        [ BSD_BASE config_vnguard ]
++#  BSD_DEBUG =      [ BSD_BASE config_vnguard ]
++#  FILESYS_BASE =   [ devfs fdesc fifo mockfs sweet_hfs fs_compression config_protect config_mnt_rootsnap config_rosv_startup config_mount_vm config_mount_prebootrecovery config_basesystemroot config_fse quota namedstreams config_imgsrc_access config_triggers config_searchfs config_volfs config_appledouble nullfs bindfs config_mnt_suid config_firmlinks config_dataless_files config_union_mounts config_file_leases ]
++#  FILESYS_RELEASE= [ FILESYS_BASE ]
++#  FILESYS_DEV =    [ FILESYS_BASE config_iocount_trace ]
++#  FILESYS_DEBUG =  [ FILESYS_BASE config_iocount_trace ]
++#  NFS =            [ nfsserver ]
++#  SKYWALK_BASE =   [ skywalk config_nexus_user_pipe config_nexus_kernel_pipe config_nexus_monitor config_nexus_flowswitch config_nexus_netif ]
++#  SKYWALK_RELEASE = [ SKYWALK_BASE ]
++#  SKYWALK_DEV =    [ SKYWALK_BASE ]
++#  SKYWALK_DEBUG =  [ SKYWALK_BASE ]
++#  NETWORKING =     [ inet bpfilter dummynet traffic_mgt sendfile ah_all_crypto bond vlan gif stf ifnet_input_chk config_mbuf_jumbo if_bridge MULTIPATH if_fake remote_vif ]
++#  NETWORKING_RELEASE = [ NETWORKING ]
++#  NETWORKING_DEV = [ NETWORKING_RELEASE packet_mangler if_headless ]
++#  NETWORKING_DEBUG = [ NETWORKING_DEV ]
++#  VPN =            [ ipsec flow_divert necp content_filter ]
++#  PF =             [ pf pflog ]
++#  MULTIPATH =      [ multipath mptcp ]
++#if SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED
++#  HIBERNATION =    [ ]
++#else /*!(SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED)*/
++#  HIBERNATION =    [ ]
++#endif /*SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED*/
++#  IOKIT_BASE =     [ iokit iokitcpp no_kernel_hid config_sleep iokitstats HIBERNATION ]
++#  IOKIT_RELEASE =  [ IOKIT_BASE ]
++#  IOKIT_DEV =      [ IOKIT_BASE iotracking ]
++#  IOKIT_DEBUG =    [ IOKIT_BASE iotracking ]
++#  LIBKERN_BASE =   [ libkerncpp config_blocks config_kec_fips crypto_sha2 config_img4 ]
++#  LIBKERN_RELEASE =[ LIBKERN_BASE zlib ]
++#  LIBKERN_DEV =    [ LIBKERN_BASE zlib iotracking ]
++#  LIBKERN_DEBUG =  [ LIBKERN_BASE zlib iotracking ]
++#  PERF_DBG_BASE =  [ config_dtrace mach_kdp config_serial_kdp kdp_interactive_debugging config_kdp_coredump_encryption config_pervasive_energy PERFMON_BASE kperf kpc ]
++#  PERF_DBG_RELEASE=[ PERF_DBG_BASE ist_kdebug ]
++#  PERF_DBG_DEV =   [ PERF_DBG_BASE lock_stats zleaks alternate_debugger sched_hygiene_debug config_debug_syscall_rejection config_iotrace ]
++#  PERF_DBG_DEBUG = [ PERF_DBG_BASE lock_stats zleaks alternate_debugger sched_hygiene_debug config_debug_syscall_rejection config_iotrace ]
++#if SOC_IS_VIRTUALIZED
++#  PARAVIRT_BASE =  [ config_pv_ticket ]
++#else
++#  PARAVIRT_BASE =  [ ]
++#endif /*SOC_IS_VIRTUALIZED*/
++#  MACH_BASE =      [ mach config_ecc_logging vc_progress_white importance_inheritance config_atm config_coalitions config_iosched config_sysdiagnose config_telemetry config_mach_bridge_recv_time config_quiesce_counter config_arm_pfz config_user_notification phys_write_acct config_service_port_info config_voucher_deprecated PARAVIRT_BASE config_ledger_interval_max ]
++#  MACH_RELEASE =   [ MACH_BASE ]
++#  MACH_DEV =       [ MACH_BASE config_io_accounting importance_trace ]
++#  MACH_DEBUG =     [ MACH_BASE config_io_accounting importance_trace importance_debug ]
++#  SCHED_BASE =     [ config_sched_traditional config_sched_multiq config_sched_deferred_ast config_clutch config_sched_sfi config_sched_auto_join config_preadopt_tg ]
++#  SCHED_RELEASE =  [ SCHED_BASE ]
++#  SCHED_DEV =      [ SCHED_BASE ]
++#  SCHED_DEBUG =    [ SCHED_BASE config_sched_grrr config_sched_proto ]
++#  VM_BASE =        [ vm_pressure_events memorystatus config_code_decryption encrypted_swap config_deferred_reclaim ]
++#  VM_RELEASE =     [ VM_BASE ]
++#  VM_DEV =         [ VM_BASE dynamic_codesigning pgzalloc ]
++#  VM_DEBUG =       [ VM_BASE dynamic_codesigning pgzalloc ]
++#  VM_KASAN =       [ VM_BASE dynamic_codesigning config_kasan config_ubsan config_kcov config_ksancov kernel_tbi ]
++#  SECURITY =       [ config_macf config_audit kernel_integrity config_csr config_csr_from_dt config_setuid config_kas_info config_secure_bsd_root config_arcade config_supplemental_signatures second_static_trust_cache reslide_shared_cache ]
++#  BASE =           [ PF VPN SECURITY NFS ]
++#  RELEASE =        [ BASE KERNEL_RELEASE BSD_RELEASE FILESYS_RELEASE SKYWALK_RELEASE NETWORKING_RELEASE IOKIT_RELEASE LIBKERN_RELEASE    PERF_DBG_RELEASE MACH_RELEASE SCHED_RELEASE VM_RELEASE ]
++#  DEVELOPMENT =    [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_DEV     ]
++#  DEBUG =          [ BASE KERNEL_DEBUG   BSD_DEBUG   FILESYS_DEBUG   SKYWALK_DEBUG   NETWORKING_DEBUG   IOKIT_DEBUG   LIBKERN_DEBUG      PERF_DBG_DEBUG   MACH_DEBUG   SCHED_DEBUG   VM_DEBUG   ]
++#  KASAN =          [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_KASAN   ]
++#
++######################################################################
++#
++machine		"arm64"						# <arm64>
++
++makeoptions	OSFMK_MACHINE = "arm64"				# <mach>
++
++options		COUNT_SYSCALLS		# count bsd system calls 	# <countcalls>
++options     TRASH_VFP_ON_SAVE   # <debug,trash_vfp>
++options		ALTERNATE_DEBUGGER	# <alternate_debugger>
++
++options   CONFIG_VNODES=1024		# <xsmall>
++
++options   CONFIG_FREEZE_SUSPENDED_MIN=4		# <xsmall>
++
++options	  CONFIG_MACH_APPROXIMATE_TIME
++
++options   CONFIG_KERNEL_INTEGRITY		# <kernel_integrity>
++
++options CONFIG_MACF_LAZY_VNODE_LABELS   # Turn on labels, don't preallocate
++
++options CONFIG_HYPERVISOR_PUBLIC   # unrestricted entitlement for hypervisor
++
++options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
++options   CONFIG_KERNEL_TBI		# <kernel_tbi>
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..6c71e7b 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -73,8 +73,13 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
++#if defined(GUAMNA)
++	/* MPIDR Aff1 = cluster (0: 4x A53, 1: 4x A73), Aff0 = core 0-3 */
++	if ((cpu->phys_id & ~0x1ffu) != 0 || (cpu->phys_id & 0xff) > 3 ||
++#else
+ 	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+ 	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
++#endif
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+diff --git a/libkern/conf/Makefile.template b/libkern/conf/Makefile.template
+index aca295c..81511b6 100644
+--- a/libkern/conf/Makefile.template
++++ b/libkern/conf/Makefile.template
+@@ -19,7 +19,7 @@ include $(MakeInc_def)
+ CFLAGS+= -include meta_features.h -DLIBKERN_KERNEL_PRIVATE -DOSALLOCDEBUG=1
+ SFLAGS+= -include meta_features.h
+ 
+-ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
++ifneq ($(filter SWEET GUAMNA,$(CURRENT_MACHINE_CONFIG)),)
+ SWEET_AES_ROOT = $(SRCROOT)/libkern/crypto/sweet_bearssl
+ SWEET_AES_INC = -I$(SWEET_AES_ROOT)/inc -I$(SWEET_AES_ROOT)/src
+ sweet_aes.o_INCFLAGS = $(SWEET_AES_INC)
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 9a748ea..5eccd64 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -29,7 +29,7 @@ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
+ else ifneq ($(findstring _host,$(RC_ProjectName)),)
+ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
+ else
+-SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET
++SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE SWEET GUAMNA
+ 
+ endif
+ 
+@@ -62,6 +62,11 @@ MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
+ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+ MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
++# guamna (SM4250): Cortex-A53 + Cortex-A73, ARMv8.0 only. -mcpu, not just -march:
++# for a macOS-SDK arm64 target Apple clang otherwise keeps target-cpu apple-m1
++# and can emit LSE/RCpc (ARMv8.1+) instructions, which are UNDEFINED here.
++# ARM64_BOARD_CONFIG_SWEET as well: all the board-independent SWEET patches apply.
++MACHINE_FLAGS_ARM64_GUAMNA = -DARM64_BOARD_CONFIG_SWEET -DARM64_BOARD_CONFIG_GUAMNA -mcpu=cortex-a53
+ 
+ 
+ #
+@@ -260,8 +265,8 @@ ifeq ($(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG),)
+ # Without embdedded device map, use a default arch string
+ export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := $(shell echo $(CURRENT_ARCH_CONFIG) | tr A-Z a-z)
+ ifneq ($(filter arm64,$(ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG)),)
+-# sweet's Cortex-A76/A55 have no pointer authentication: stay plain arm64
+-ifneq ($(CURRENT_MACHINE_CONFIG),SWEET)
++# sweet's Cortex-A76/A55 and guamna's A73/A53 have no pointer authentication: stay plain arm64
++ifeq ($(filter SWEET GUAMNA,$(CURRENT_MACHINE_CONFIG)),)
+ export ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG := arm64e
+ endif
+ endif
+diff --git a/osfmk/arm/commpage/commpage_asm.s b/osfmk/arm/commpage/commpage_asm.s
+index da0bbba..93a21f4 100644
+--- a/osfmk/arm/commpage/commpage_asm.s
++++ b/osfmk/arm/commpage/commpage_asm.s
+@@ -273,7 +273,18 @@ _pfz_trylock_and_enqueue:
+ 	mov		w11, #1			 // locked value = w11 = 1
+ 
+ 	// Try to grab the lock
++#if __ARM_FEATURE_ATOMICS
+ 	casa	w10, w11, [x3]	 // Atomic CAS with acquire barrier
++#else
++	// ARMv8.0 (no LSE): same acquire-CAS of 0 -> 1 with exclusives; w10 = old value
++1:	ldaxr	w10, [x3]
++	cbnz	w10, 2f
++	stxr	w12, w11, [x3]
++	cbnz	w12, 1b
++	b	3f
++2:	clrex
++3:
++#endif
+ 	cbz		w10, Ltrylock_enqueue_success
+ 
+ 	mov		x0, #-1			// Failed
+@@ -323,7 +334,17 @@ _pfz_trylock_and_dequeue:
+ 	mov		w10, wzr		 // unlock value = w10 = 0
+ 	mov		w11, #1			 // locked value = w11 = 1
+ 
++#if __ARM_FEATURE_ATOMICS
+ 	casa	w10, w11, [x2]	 // Atomic CAS with acquire barrier
++#else
++1:	ldaxr	w10, [x2]
++	cbnz	w10, 2f
++	stxr	w12, w11, [x2]
++	cbnz	w12, 1b
++	b	3f
++2:	clrex
++3:
++#endif
+ 	cbz		w10, Ltrylock_dequeue_success
+ 
+ 	mov		x0, #-1			// Failed
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 06bb568..00b3e4e 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1825,7 +1825,7 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool
+ #define ARM64_PHYSMAP_ALIGNMENT_PADDING (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE)
+ #endif
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && SWEET_EARLY_FB
+ /*
+  * The reserved low-globals/kernel region is excluded from VM allocation.
+  * Use the otherwise empty 32MB block above low globals and below gVirtBase
+@@ -2179,7 +2179,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 
+ 	arm_set_user_tbi();
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && SWEET_EARLY_FB
+ 	/* phystokv() must still refer to the bootstrap aperture here. */
+ 	sweet_early_map_final();
+ #endif
+@@ -2188,7 +2188,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 
+ 	ml_enable_monitor();
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && SWEET_EARLY_FB
+ 	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
+ 	sweet_early_relocate(SWEET_EARLY_FB_VA);
+ #endif
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index e4c15f2..0f002b4 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1087,7 +1087,7 @@ ml_parse_cpu_topology(void)
+ 		}
+ #endif
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && !defined(GUAMNA)
+ 		/* Aff1 encodes the core on SM7150, not an Apple cluster ID. */
+ 		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", 0);
+ 		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", cpu->phys_id >> 8);
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 023086f..ac7e0f9 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -513,7 +513,7 @@ LEXT(start_first_cpu)
+ 	mov		x20, x0
+ 	mov		x21, #0
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && SWEET_EARLY_FB
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+ 	MOV64	x0, (0x9c000000 + 2368 * 4320)
+ 	mov		w1, #-1
+@@ -678,7 +678,7 @@ Lkernelcache_base_found:
+ 	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
+ 	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && SWEET_EARLY_FB
+ 	/*
+ 	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+ 	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 6928957..f75dc59 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -7,7 +7,7 @@
+  */
+ #include <arm64/sweet_early.h>
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && SWEET_EARLY_FB
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index d7a25f2..ee7abcf 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -6,7 +6,7 @@
+ #include <stdarg.h>
+ #include <stdint.h>
+ 
+-#if defined(SWEET)
++#if defined(SWEET) && SWEET_EARLY_FB
+ void sweet_early_mark(unsigned int stage, const char *label);
+ void sweet_early_putc(char c);
+ void sweet_early_panic(const char *fmt, va_list *args);
+@@ -19,6 +19,19 @@ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ 	(void)label;
+ }
+ static inline void sweet_early_disable(void) {}
++static inline void sweet_early_putc(char c)
++{
++	(void)c;
++}
++static inline void sweet_early_panic(const char *fmt, va_list *args)
++{
++	(void)fmt;
++	(void)args;
++}
++static inline void sweet_early_relocate(uint64_t base)
++{
++	(void)base;
++}
+ #endif
+ 
+ #endif
+diff --git a/pexpert/pexpert/arm64/GUAMNA.h b/pexpert/pexpert/arm64/GUAMNA.h
+new file mode 100644
+index 0000000..950f9c2
+--- /dev/null
++++ b/pexpert/pexpert/arm64/GUAMNA.h
+@@ -0,0 +1,87 @@
++/*
++ * Board config for the Motorola Moto G Play 2021 ("guamna", Qualcomm SM4250 /
++ * Snapdragon 460, "bengal"): Kryo 240 = 4x Cortex-A73 + 4x Cortex-A53,
++ * ARMv8.0-A. Compared with SWEET (SM7150, ARMv8.2):
++ *
++ *   - 4K pages: the A53 does not implement the 16K translation granule
++ *     (ID_AA64MMFR0_EL1.TGran16 = 0), so __ARM_16K_PG__ stays undefined,
++ *     like BCM2837 (Raspberry Pi 3, also Cortex-A53).
++ *   - No PAN (ARMv8.1), no LSE atomics (ARMv8.1), no RCpc/LDAPR (ARMv8.3),
++ *     no UAO/DPB (ARMv8.2), no PAC. The compiler is pinned to -mcpu=cortex-a53
++ *     in makedefs/MakeInc.def.
++ *   - MPIDR is classic big.LITTLE: Aff1 = cluster, Aff0 = core.
++ *   - Same GICv3 with two security states and the same Qualcomm timer PPI
++ *     numbering as sweet (verify both with tools/fdt-survey.py).
++ *
++ * SWEET stays defined so the board-independent SWEET code (GIC Group 1 IRQ
++ * path, PSCI SMP, platform expert, IOKit services) is shared. GUAMNA marks
++ * the differences. The sweet-only bootstrap framebuffer console (16K tables,
++ * fixed 0x9c000000 splash) is off: SWEET_EARLY_FB is not defined; the kernel
++ * console appears once pe_serial maps /sweet-fbcon from the ADT.
++ */
++
++#ifndef _PEXPERT_ARM64_GUAMNA_H
++#define _PEXPERT_ARM64_GUAMNA_H
++
++#define NO_MONITOR                1
++#define NO_ECORE                  1
++
++#define SWEET                     1
++#define GUAMNA                    1
++/* 1 once bsd/dev/guamna_emmc.c (patch 0083) provides root storage and the log. */
++#define GUAMNA_EMMC               0
++
++/* 4x A53 (MPIDR 0x000-0x003) + 4x A73 (0x100-0x103), one SMP cluster for XNU. */
++#define SWEET_SMP_MAX_CPUS        8
++
++#define ARM_ARCH_TIMER
++#define __ARM_ARCH__              8
++#define __ARM_VMSA__              8
++#define __ARM_VFP__               4
++#define __ARM_COHERENT_CACHE__    1
++#define __ARM_DEBUG__             7
++#define __ARM_ENABLE_SWAP__       1
++#define __ARM_V8_CRYPTO_EXTENSIONS__ 1
++/* Not defined on purpose: __ARM_PAN_AVAILABLE__ (ARMv8.1), __ARM_16K_PG__. */
++
++#define HAS_GIC_V3                1
++
++#ifndef ASSEMBLER
++#define PLATFORM_PANIC_LOG_DISABLED
++#endif /* ! ASSEMBLER */
++
++/* <GIC_PPI 3 ...> in bengal's timer node: INTID 16 + 3. Verify. */
++#define SWEET_VTIMER_INTID        19
++#define SWEET_IPI_SGI             1       // SGI used for cross-CPU signals
++
++#define GIC_SPURIOUS_IRQ          1023    // IRQ no. for GIC spurious interrupt
++
++#define GICR_PE_SIZE              0x20000 // Size of each redistributor region
++
++/* GICv3 register definitions; see GICv3 spec (Arm IHI 0069G) */
++#define GICD_CTLR                 0x0
++
++/* Non-secure view of GICD_CTLR (DS=0) */
++#define GICD_CTLR_ENABLEGRP1      0x1
++#define GICD_CTLR_ENABLEGRP1A     0x2
++#define GICD_CTLR_ARE_NS          0x10
++#define GICD_CTLR_RWP             0x80000000
++
++#define GICR_TYPER                              0x08
++#define GICR_WAKER                              0x14
++#define GICR_IGROUPR0                           0x10080
++#define GICR_ISENABLER0                         0x10100
++#define GICR_IPRIORITYR0                        0x10400
++
++#define GICR_TYPER_AFFINITY_VALUE_SHIFT         32
++#define GICR_TYPER_LAST                         0x10
++
++#define GICR_WAKER_PROCESSORSLEEP               0x2
++#define GICR_WAKER_CHILDRENASLEEP               0x4
++
++#define ICC_CTLR_EOIMODE                        0x2
++
++#define ICC_SRE_SRE                             0x1
++/* End of GICv3 register definitions */
++
++#endif /* ! _PEXPERT_ARM64_GUAMNA_H */
+diff --git a/pexpert/pexpert/arm64/Makefile b/pexpert/pexpert/arm64/Makefile
+index c7d274f..71cfd9e 100644
+--- a/pexpert/pexpert/arm64/Makefile
++++ b/pexpert/pexpert/arm64/Makefile
+@@ -18,7 +18,8 @@ PRIVATE_KERNELFILES = \
+ 	H13.h \
+ 	VMAPPLE.h \
+ 	BCM2837.h \
+-	SWEET.h
++	SWEET.h \
++	GUAMNA.h
+ 
+ 
+ # Headers installed into System.framework/PrivateHeaders (userspace internal SDK only).
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index b99c2f4..ddb3565 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -16,6 +16,9 @@
+ #define NO_ECORE                  1
+ 
+ #define SWEET                     1
++/* Bootstrap framebuffer console (osfmk/arm64/sweet_early.c, start.s, arm_vm_init.c):
++ * hard-wired to the 16K-granule bootstrap tables and the 0x9c000000 splash. */
++#define SWEET_EARLY_FB            1
+ 
+ /*
+  * All eight cores (six A55 + two A76) as one homogeneous SMP cluster:
+diff --git a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+index 88e524a..577dc64 100644
+--- a/pexpert/pexpert/arm64/board_config.h
++++ b/pexpert/pexpert/arm64/board_config.h
+@@ -97,7 +97,16 @@
+ #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+ #endif  /* ARM64_BOARD_CONFIG_BCM2837 */
+ 
+-#ifdef ARM64_BOARD_CONFIG_SWEET
++#if defined(ARM64_BOARD_CONFIG_GUAMNA)
++#include <pexpert/arm64/GUAMNA.h>
++
++#define MAX_L2_CLINE                   6
++#define MAX_CPUS                       8
++#define MAX_CPU_CLUSTERS               1
++
++#define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
++
++#elif defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <pexpert/arm64/SWEET.h>
+ 
+ #define MAX_L2_CLINE                   6

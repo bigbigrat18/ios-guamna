@@ -1,0 +1,978 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index e2a137f..4e035f4 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/guamna_stubs.c			standard
++bsd/dev/guamna_emmc.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/guamna_emmc.c b/bsd/dev/guamna_emmc.c
+new file mode 100644
+index 0000000..798129c
+--- /dev/null
++++ b/bsd/dev/guamna_emmc.c
+@@ -0,0 +1,918 @@
++/*
++ * GUAMNA internal eMMC root device (Moto G Play 2021, SM4250 SDHC1).
++ *
++ * The eMMC 5.1 card behind Qualcomm's sdhci-msm v5 controller is left
++ * initialized by ABL, which loaded our boot image from it: clocks, bus width,
++ * HS200/HS400 timing and tuning are all set up and the card is selected. Like
++ * sweet_ufs.c does for UFS, this driver only reuses that state. It never
++ * touches clocks, power or HOST_CONTROL2 (on sdhci-msm those writes raise a
++ * power-IRQ handshake that only a full driver can answer). It:
++ *   - finds the card's RCA with CMD13 and selects it (CMD7) if needed,
++ *   - reads EXT_CSD (CMD8), switches to the user area and turns command
++ *     queueing off if ABL left either set (CMD6),
++ *   - issues polled CMD18/CMD25 (Auto CMD12) through ADMA2, one at a time,
++ *     to/from a 1 MiB bounce buffer,
++ *   - finds a GPT partition by name (boot-arg emmcroot=, default "userdata")
++ *     and exposes it as emmcroot0 / remmcroot0. Root on it with rd=emmcroot0.
++ * Writes need emmcrw=1. The persistent console log keeps sweet's on-disk
++ * format (last 4 MiB + 4 KiB of the partition), so tools/sweet-log-pull.sh
++ * works unchanged.
++ *
++ * The controller is not cache coherent: the bounce buffer and descriptors
++ * are cleaned/invalidated around each command.
++ *
++ * UNTESTED ON HARDWARE. Register offsets are standard SDHCI 3.0/4.x.
++ */
++#if defined(ARM64_BOARD_CONFIG_GUAMNA)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++#include <machine/atomic.h>
++
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++/* osfmk/arm/machine_routines.h, not exported to the BSD layer */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++extern void sweet_sample_start(void);
++
++/* SDHCI registers (offsets from the "hc" region) */
++#define SD_BLKSIZE_CNT  0x04    /* [15:0] block size, [31:16] block count */
++#define SD_ARGUMENT     0x08
++#define SD_MODE_CMD     0x0c    /* [15:0] transfer mode, [31:16] command */
++#define SD_RESP0        0x10
++#define SD_RESP3        0x1c    /* Auto CMD12 response lands here */
++#define SD_PRESENT      0x24
++#define SD_HOST_CTRL    0x28    /* 8-bit */
++#define SD_SW_RESET     0x2f    /* 8-bit */
++#define SD_INT_STATUS   0x30    /* [15:0] normal, [31:16] error */
++#define SD_INT_ENABLE   0x34
++#define SD_SIG_ENABLE   0x38
++#define SD_HOST_CTRL2   0x3c    /* upper 16 bits of the dword */
++#define SD_CAPS         0x40
++#define SD_ADMA_ERR     0x54
++#define SD_ADMA_LO      0x58
++#define SD_ADMA_HI      0x5c
++#define SD_VERSION      0xfc    /* upper 16 bits */
++
++#define PS_CMD_INHIBIT  (1u << 0)
++#define PS_DAT_INHIBIT  (1u << 1)
++#define PS_DAT0         (1u << 20)
++
++#define HC_DMA_MASK     (3u << 3)
++#define HC_DMA_ADMA2    (2u << 3)
++
++#define HC2_V4_ENABLE   (1u << 12)
++#define HC2_64BIT_ADDR  (1u << 13)
++
++#define CAP_ADMA2       (1u << 19)
++
++#define IS_CMD_DONE     (1u << 0)
++#define IS_XFER_DONE    (1u << 1)
++#define IS_ERROR        (1u << 15)
++#define IS_ERR_SHIFT    16
++
++#define RST_CMD         (1u << 1)
++#define RST_DAT         (1u << 2)
++
++#define TM_DMA          (1u << 0)
++#define TM_BLKCNT       (1u << 1)
++#define TM_AUTO_CMD12   (1u << 2)
++#define TM_READ         (1u << 4)
++#define TM_MULTI        (1u << 5)
++
++#define CMD_RESP_NONE   0x00u
++#define CMD_RESP_R1     0x1au   /* 48 bit, CRC + index check */
++#define CMD_RESP_R1B    0x1bu   /* 48 bit busy, CRC + index check */
++#define CMD_DATA        0x20u
++
++#define ADMA_VALID      0x01u
++#define ADMA_END        0x02u
++#define ADMA_TRAN       0x20u
++#define ADMA_CHUNK      0x8000u /* 32 KiB per descriptor: no 16-bit length=0 corner */
++
++/* R1 card status */
++#define R1_ERRORS       0xfdf80080u     /* out of range ... error, switch error */
++#define R1_STATE(r)     (((r) >> 9) & 0xf)
++#define R1_STATE_STBY   3
++#define R1_STATE_TRAN   4
++
++/* EXT_CSD bytes */
++#define EXT_CSD_CMDQ_MODE_EN    15
++#define EXT_CSD_FLUSH_CACHE     32
++#define EXT_CSD_CACHE_CTRL      33
++#define EXT_CSD_PART_CONFIG     179
++#define EXT_CSD_SEC_COUNT       212
++
++#define EMMC_SECT       512u
++#define BOUNCE_SIZE     (1u << 20)
++#define DESC_MAX        (BOUNCE_SIZE / ADMA_CHUNK)
++#define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
++
++/* Layout of the contiguous DMA allocation. */
++#define DMA_DESC        0x0000          /* <= DESC_MAX * 16 bytes */
++#define DMA_BOUNCE      0x1000
++#define DMA_SIZE        (DMA_BOUNCE + BOUNCE_SIZE)
++
++static struct {
++	vm_offset_t regs, cqhci;
++	vm_offset_t dma;
++	uint64_t dma_pa;
++	unsigned desc_size;                     /* 8 (32-bit), 12 (v3 64-bit), 16 (v4 64-bit) */
++	uint32_t rca;
++	bool cache_on;                          /* EXT_CSD CACHE_CTRL */
++	uint64_t card_sectors;
++	uint64_t first, nsect;                  /* partition, in 512-byte sectors */
++	uint32_t secsize;
++	bool writable;
++	int bmajor, cmajor;
++	dev_t bdev;
++	bool ready;
++} se;
++
++static LCK_GRP_DECLARE(guamna_emmc_grp, "guamna_emmc");
++static LCK_MTX_DECLARE(guamna_emmc_lock, &guamna_emmc_grp);
++
++static inline uint32_t
++rd32(uint32_t off)
++{
++	return *(volatile uint32_t *)(se.regs + off);
++}
++
++static inline void
++wr32(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(se.regs + off) = v;
++}
++
++static inline uint8_t
++rd8(uint32_t off)
++{
++	return *(volatile uint8_t *)(se.regs + off);
++}
++
++static inline void
++wr8(uint32_t off, uint8_t v)
++{
++	*(volatile uint8_t *)(se.regs + off) = v;
++}
++
++static void
++dma_sync(uint32_t off, uint32_t len)
++{
++	flush_dcache64((addr64_t)(se.dma_pa + off), len, TRUE);
++}
++
++static bool
++timed_out(uint64_t deadline)
++{
++	return mach_absolute_time() > deadline;
++}
++
++static uint64_t
++deadline_in(uint64_t ns)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime(ns, &t);
++	return mach_absolute_time() + t;
++}
++
++static void
++emmc_reset_lines(void)
++{
++	wr8(SD_SW_RESET, RST_CMD | RST_DAT);    /* not RESET_ALL: that powers the bus off */
++	uint64_t dl = deadline_in(100 * NSEC_PER_MSEC);
++	while ((rd8(SD_SW_RESET) & (RST_CMD | RST_DAT)) && !timed_out(dl)) {
++		delay(1);
++	}
++	wr32(SD_INT_STATUS, 0xffffffffu);
++}
++
++/* Wait for any bit of `want`, or an error. Returns 0, EIO or ETIMEDOUT. */
++static int
++emmc_wait(uint32_t want, uint64_t deadline, uint32_t *status)
++{
++	for (;;) {
++		uint32_t is = rd32(SD_INT_STATUS);
++		if (is & IS_ERROR) {
++			*status = is;
++			return EIO;
++		}
++		if (is & want) {
++			wr32(SD_INT_STATUS, is & want);
++			*status = is;
++			return 0;
++		}
++		if (timed_out(deadline)) {
++			*status = is;
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++}
++
++static void
++adma_fill(uint32_t len)
++{
++	uint8_t *d = (uint8_t *)(se.dma + DMA_DESC);
++	uint64_t pa = se.dma_pa + DMA_BOUNCE;
++	unsigned n = 0;
++
++	for (uint32_t done = 0; done < len; done += ADMA_CHUNK, n++) {
++		uint32_t chunk = MIN(ADMA_CHUNK, len - done);
++		uint8_t *e = d + n * se.desc_size;
++		uint16_t attr = ADMA_VALID | ADMA_TRAN | (done + chunk >= len ? ADMA_END : 0);
++		uint32_t w0 = attr | (chunk << 16);
++		uint32_t lo = (uint32_t)(pa + done), hi = (uint32_t)((pa + done) >> 32);
++		bzero(e, se.desc_size);
++		memcpy(e, &w0, 4);
++		memcpy(e + 4, &lo, 4);
++		if (se.desc_size > 8) {
++			memcpy(e + 8, &hi, 4);
++		}
++	}
++	dma_sync(DMA_DESC, n * se.desc_size);
++}
++
++/*
++ * One command. With nblk != 0 it moves nblk sectors to/from the bounce
++ * buffer (from the card when !write); multi selects CMD18/25 semantics
++ * (multi-block + Auto CMD12). Returns 0 or an errno; *r1 gets RESP0.
++ */
++static int
++emmc_cmd(uint32_t idx, uint32_t arg, uint32_t resp, uint32_t nblk, bool write, bool multi, uint32_t *r1)
++{
++	uint32_t len = nblk * EMMC_SECT;
++	uint32_t inhibit = PS_CMD_INHIBIT | ((nblk || resp == CMD_RESP_R1B) ? PS_DAT_INHIBIT : 0);
++	uint64_t dl = deadline_in(CMD_TIMEOUT_NS);
++	uint32_t is = 0, mode = 0;
++	int error;
++
++	assert(len <= BOUNCE_SIZE);
++	while (rd32(SD_PRESENT) & inhibit) {
++		if (timed_out(dl)) {
++			printf("GUAMNA eMMC: CMD%u: lines busy (present 0x%x)\n", idx, rd32(SD_PRESENT));
++			emmc_reset_lines();
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	wr32(SD_INT_STATUS, 0xffffffffu);
++
++	if (nblk) {
++		adma_fill(len);
++		dma_sync(DMA_BOUNCE, len);
++		uint64_t desc_pa = se.dma_pa + DMA_DESC;
++		wr32(SD_ADMA_LO, (uint32_t)desc_pa);
++		if (se.desc_size > 8) {
++			wr32(SD_ADMA_HI, (uint32_t)(desc_pa >> 32));
++		}
++		wr32(SD_BLKSIZE_CNT, EMMC_SECT | (7u << 12) | (nblk << 16));
++		mode = TM_DMA | TM_BLKCNT | (write ? 0 : TM_READ) | (multi ? (TM_MULTI | TM_AUTO_CMD12) : 0);
++		resp |= CMD_DATA;
++	}
++	__builtin_arm_dsb(0xf);
++	wr32(SD_ARGUMENT, arg);
++	/* Transfer mode and command in one 32-bit write: the command write starts it. */
++	wr32(SD_MODE_CMD, mode | ((idx << 8 | resp) << 16));
++
++	error = emmc_wait(IS_CMD_DONE, dl, &is);
++	if (!error && (nblk || resp == CMD_RESP_R1B)) {
++		error = emmc_wait(IS_XFER_DONE, dl, &is);
++	}
++	if (error) {
++		if (idx != 13) {        /* CMD13 timeouts are expected while probing the RCA */
++			printf("GUAMNA eMMC: CMD%u arg 0x%x: %s, status 0x%08x adma 0x%x\n", idx, arg,
++			    error == ETIMEDOUT ? "timeout" : "error", is, rd8(SD_ADMA_ERR));
++		}
++		emmc_reset_lines();
++		return error;
++	}
++	if (nblk) {
++		dma_sync(DMA_BOUNCE, len);
++	}
++	uint32_t status = rd32(SD_RESP0);
++	if (r1) {
++		*r1 = status;
++	}
++	if (resp != CMD_RESP_NONE && (status & R1_ERRORS)) {
++		printf("GUAMNA eMMC: CMD%u arg 0x%x: card status 0x%08x\n", idx, arg, status);
++		return EIO;
++	}
++	if (multi && (rd32(SD_RESP3) & R1_ERRORS)) {
++		printf("GUAMNA eMMC: CMD%u arg 0x%x: CMD12 status 0x%08x\n", idx, arg, rd32(SD_RESP3));
++		return EIO;
++	}
++	return 0;
++}
++
++/* CMD6 SWITCH, write byte: waits for busy to end and checks SWITCH_ERROR. */
++static int
++emmc_switch(uint8_t index, uint8_t value)
++{
++	uint32_t r1 = 0;
++	int error = emmc_cmd(6, (3u << 24) | ((uint32_t)index << 16) | ((uint32_t)value << 8), CMD_RESP_R1B,
++	    0, false, false, NULL);
++	if (!error) {
++		error = emmc_cmd(13, se.rca << 16, CMD_RESP_R1, 0, false, false, &r1);
++	}
++	if (!error && R1_STATE(r1) != R1_STATE_TRAN) {
++		printf("GUAMNA eMMC: after SWITCH %u=%u card state %u\n", index, value, R1_STATE(r1));
++		error = EIO;
++	}
++	return error;
++}
++
++static int
++emmc_read(uint64_t sector, uint32_t count)
++{
++	if (count == 0 || count > BOUNCE_SIZE / EMMC_SECT || sector + count > se.card_sectors) {
++		return EINVAL;
++	}
++	return emmc_cmd(18, (uint32_t)sector, CMD_RESP_R1, count, false, true, NULL);
++}
++
++/* The only place data goes out: refuses anything outside the partition. */
++static int
++emmc_write(uint64_t sector, uint32_t count)
++{
++	if (!se.writable || !se.nsect || count == 0 || count > BOUNCE_SIZE / EMMC_SECT ||
++	    sector < se.first || sector - se.first >= se.nsect || count > se.nsect - (sector - se.first)) {
++		printf("GUAMNA eMMC: refusing write of %u sectors at 0x%llx\n", count, sector);
++		return EPERM;
++	}
++	return emmc_cmd(25, (uint32_t)sector, CMD_RESP_R1, count, true, true, NULL);
++}
++
++static int
++emmc_flush(void)
++{
++	return se.cache_on ? emmc_switch(EXT_CSD_FLUSH_CACHE, 1) : 0;
++}
++
++/* Find the RCA ABL assigned and make sure the card is selected (TRAN). */
++static int
++emmc_find_card(uint32_t rca_hint)
++{
++	uint32_t cand[] = { rca_hint, 2, 1, 3 };
++	uint32_t r1 = 0;
++
++	for (unsigned i = 0; i < sizeof(cand) / sizeof(cand[0]); i++) {
++		if (cand[i] == 0 || (i > 0 && cand[i] == rca_hint)) {
++			continue;
++		}
++		if (emmc_cmd(13, cand[i] << 16, CMD_RESP_R1, 0, false, false, &r1) == 0) {
++			se.rca = cand[i];
++			break;
++		}
++	}
++	if (!se.rca) {
++		printf("GUAMNA eMMC: no card answers CMD13 (tried RCA %u, 2, 1, 3)\n", rca_hint);
++		return ENXIO;
++	}
++	printf("GUAMNA eMMC: RCA %u, state %u\n", se.rca, R1_STATE(r1));
++	if (R1_STATE(r1) == R1_STATE_STBY) {
++		int error = emmc_cmd(7, se.rca << 16, CMD_RESP_R1B, 0, false, false, NULL);
++		if (error) {
++			return error;
++		}
++	} else if (R1_STATE(r1) != R1_STATE_TRAN) {
++		return EIO;
++	}
++	return 0;
++}
++
++static int
++emmc_ext_csd(void)
++{
++	const uint8_t *e = (const uint8_t *)(se.dma + DMA_BOUNCE);
++	int error = emmc_cmd(8, 0, CMD_RESP_R1, 1, false, false, NULL);
++	if (error) {
++		return error;
++	}
++	uint32_t sec;
++	memcpy(&sec, e + EXT_CSD_SEC_COUNT, 4);
++	se.card_sectors = sec;
++	se.cache_on = e[EXT_CSD_CACHE_CTRL] & 1;
++	uint8_t part = e[EXT_CSD_PART_CONFIG], cmdq = e[EXT_CSD_CMDQ_MODE_EN];
++	printf("GUAMNA eMMC: EXT_CSD rev %u, %llu MiB, partition config 0x%x, cmdq %u, cache %u\n",
++	    e[192], se.card_sectors >> 11, part, cmdq, se.cache_on);
++	/* Sector addressing (high capacity) is all this driver speaks. */
++	if (se.card_sectors <= (2ull << 30) / EMMC_SECT) {
++		return ENXIO;
++	}
++	if (cmdq & 1) {
++		error = emmc_switch(EXT_CSD_CMDQ_MODE_EN, 0);
++		if (error) {
++			return error;
++		}
++	}
++	if (part & 7) {
++		error = emmc_switch(EXT_CSD_PART_CONFIG, part & ~7u);   /* user area */
++	}
++	return error;
++}
++
++static int
++emmc_find_partition(const char *want)
++{
++	const uint8_t *b = (const uint8_t *)(se.dma + DMA_BOUNCE);
++	int error = emmc_read(1, 1);
++	if (error) {
++		return error;
++	}
++	if (memcmp(b, "EFI PART", 8) != 0) {
++		printf("GUAMNA eMMC: no GPT\n");
++		return ENXIO;
++	}
++	uint64_t entry_lba;
++	uint32_t nent, esz;
++	memcpy(&entry_lba, b + 72, 8);
++	memcpy(&nent, b + 80, 4);
++	memcpy(&esz, b + 84, 4);
++	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
++		printf("GUAMNA eMMC: unsupported GPT entries %u x %u\n", nent, esz);
++		return ENXIO;
++	}
++	error = emmc_read(entry_lba, (nent * esz + EMMC_SECT - 1) / EMMC_SECT);
++	if (error) {
++		return error;
++	}
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = b + i * esz;
++		char name[37];
++		unsigned c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (strcmp(name, want) != 0) {
++			continue;
++		}
++		uint64_t first, last;
++		memcpy(&first, e + 32, 8);
++		memcpy(&last, e + 40, 8);
++		if (last < first || last >= se.card_sectors) {
++			return ENXIO;
++		}
++		se.first = first;
++		se.nsect = last - first + 1;
++		return 0;
++	}
++	printf("GUAMNA eMMC: no GPT partition named \"%s\"\n", want);
++	return ENOENT;
++}
++
++static int
++emmc_take_over_host(void)
++{
++	uint32_t ver = rd32(SD_VERSION) >> 16, caps = rd32(SD_CAPS);
++	uint32_t hc2 = rd32(SD_HOST_CTRL2) >> 16;
++
++	if (se.cqhci) {
++		uint32_t cqcfg = *(volatile uint32_t *)(se.cqhci + 0x08);
++		if (cqcfg & 1) {
++			printf("GUAMNA eMMC: ABL left the command queue engine on (CQCFG 0x%x)\n", cqcfg);
++			return EBUSY;
++		}
++	}
++	if (!(caps & CAP_ADMA2)) {
++		printf("GUAMNA eMMC: no ADMA2 (caps 0x%x)\n", caps);
++		return ENXIO;
++	}
++	if ((hc2 & HC2_V4_ENABLE) && (hc2 & HC2_64BIT_ADDR)) {
++		se.desc_size = 16;
++	} else {
++		se.desc_size = 8;       /* v3 32-bit ADMA2; RAM is below 4 GiB on guamna */
++		if (se.dma_pa + DMA_SIZE > (1ull << 32)) {
++			printf("GUAMNA eMMC: DMA buffer above 4 GiB\n");
++			return ENOMEM;
++		}
++	}
++	printf("GUAMNA eMMC: SDHCI spec %u, host ctrl 0x%x, ctrl2 0x%x, caps 0x%x, present 0x%x\n",
++	    (ver & 0xff) + 1, rd8(SD_HOST_CTRL), hc2, caps, rd32(SD_PRESENT));
++
++	wr32(SD_SIG_ENABLE, 0);                 /* polled: no interrupt lines */
++	wr32(SD_INT_ENABLE, 0x03ff000bu);       /* status latches: cmd/xfer/dma done, all errors */
++	wr32(SD_INT_STATUS, 0xffffffffu);
++	wr8(SD_HOST_CTRL, (uint8_t)((rd8(SD_HOST_CTRL) & ~HC_DMA_MASK) | HC_DMA_ADMA2));
++	if ((rd8(SD_HOST_CTRL) & HC_DMA_MASK) != HC_DMA_ADMA2) {
++		printf("GUAMNA eMMC: host did not take ADMA2\n");
++		return EIO;
++	}
++	return 0;
++}
++
++static int
++guamna_emmc_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++{
++	if (!se.ready) {
++		return ENXIO;
++	}
++	return ((flags & FWRITE) && !se.writable) ? EROFS : 0;
++}
++
++static int
++guamna_emmc_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++guamna_emmc_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * se.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t part_bytes = se.nsect * EMMC_SECT;
++	bool rd = buf_flags(bp) & B_READ;
++
++	buf_setresid(bp, count);
++	if (!rd && !se.writable) {
++		error = EROFS;
++		goto done;
++	}
++	if (off > part_bytes || count > part_bytes - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++
++	lck_mtx_lock(&guamna_emmc_lock);
++	for (uint32_t done = 0; done < count;) {
++		uint64_t pos = off + done;
++		uint64_t lba = pos / EMMC_SECT;
++		uint32_t skip = (uint32_t)(pos % EMMC_SECT);
++		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
++		uint32_t blocks = (skip + want + EMMC_SECT - 1) / EMMC_SECT;
++		void *bounce = (void *)(se.dma + DMA_BOUNCE);
++		if (rd) {
++			error = emmc_read(se.first + lba, blocks);
++			if (!error) {
++				memcpy(vaddr + done, (const char *)bounce + skip, want);
++			}
++		} else {
++			/* Partial sectors at either end: read, merge, write back. */
++			if (skip || (want % EMMC_SECT)) {
++				error = emmc_read(se.first + lba, blocks);
++			}
++			if (!error) {
++				memcpy((char *)bounce + skip, vaddr + done, want);
++				error = emmc_write(se.first + lba, blocks);
++			}
++		}
++		if (error) {
++			break;
++		}
++		done += want;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(&guamna_emmc_lock);
++	buf_unmap(bp);
++
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++guamna_emmc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p, int is_char)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = se.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
++		}
++		if (*f < DEV_BSIZE || *f > 4096 || (*f & (*f - 1))) {
++			return EINVAL;
++		}
++		se.secsize = *f;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = EMMC_SECT;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = se.nsect * EMMC_SECT / se.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = se.writable;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE: {
++		if (!se.writable) {
++			return 0;
++		}
++		lck_mtx_lock(&guamna_emmc_lock);
++		int error = emmc_flush();
++		lck_mtx_unlock(&guamna_emmc_lock);
++		return error;
++	}
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*o = BOUNCE_SIZE / se.secsize;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = se.writable ? BOUNCE_SIZE / se.secsize : 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++guamna_emmc_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return guamna_emmc_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++guamna_emmc_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return guamna_emmc_ioctl(dev, cmd, data, flag, p, 1);
++}
++
++static int
++guamna_emmc_psize(__unused dev_t dev)
++{
++	return se.ready ? (int)MIN(se.nsect * EMMC_SECT / se.secsize, INT_MAX) : -1;
++}
++
++static int
++guamna_emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(guamna_emmc_strategy, NULL, dev, B_READ, minphys, uio, (int)se.secsize);
++}
++
++static int
++guamna_emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	if (!se.writable) {
++		return EROFS;
++	}
++	return physio(guamna_emmc_strategy, NULL, dev, B_WRITE, minphys, uio, (int)se.secsize);
++}
++
++static const struct bdevsw guamna_emmc_bdevsw = {
++	.d_open     = guamna_emmc_open,
++	.d_close    = guamna_emmc_close,
++	.d_strategy = guamna_emmc_strategy,
++	.d_ioctl    = guamna_emmc_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = guamna_emmc_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw guamna_emmc_cdevsw = {
++	.d_open       = guamna_emmc_open,
++	.d_close      = guamna_emmc_close,
++	.d_read       = guamna_emmc_read,
++	.d_write      = guamna_emmc_write,
++	.d_ioctl      = guamna_emmc_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++static void guamna_log_start(void);
++
++static int
++guamna_emmc_init(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	char want[64] = "userdata";
++	uint32_t rw = 0, rca = 0;
++	int error;
++
++	if (SecureDTLookupEntry(NULL, "/guamna-emmc", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("GUAMNA eMMC: no /guamna-emmc node in the device tree\n");
++		return ENXIO;
++	}
++	PE_parse_boot_argn("emmcroot", want, sizeof(want));
++	PE_parse_boot_argn("emmcrw", &rw, sizeof(rw));
++	PE_parse_boot_argn("emmcrca", &rca, sizeof(rca));
++
++	se.regs = ml_io_map(reg[0], reg[1]);
++	if (size >= 4 * sizeof(uintptr_t)) {
++		se.cqhci = ml_io_map(reg[2], reg[3]);
++	}
++	if (kmem_alloc_contig(kernel_map, &se.dma, DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("GUAMNA eMMC: no contiguous DMA memory\n");
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)se.dma);
++	if (!pn) {
++		return ENOMEM;
++	}
++	se.dma_pa = ptoa_64(pn);
++	se.secsize = DEV_BSIZE;
++
++	lck_mtx_lock(&guamna_emmc_lock);
++	error = emmc_take_over_host();
++	if (!error) {
++		error = emmc_find_card(rca);
++	}
++	if (!error) {
++		error = emmc_ext_csd();
++	}
++	if (!error) {
++		error = emmc_find_partition(want);
++	}
++	lck_mtx_unlock(&guamna_emmc_lock);
++	if (error) {
++		return error;
++	}
++
++	se.bmajor = bdevsw_add(-1, &guamna_emmc_bdevsw);
++	if (se.bmajor < 0) {
++		return ENXIO;
++	}
++	se.cmajor = cdevsw_add_with_bdev(-1, &guamna_emmc_cdevsw, se.bmajor);
++	if (se.cmajor < 0) {
++		return ENXIO;
++	}
++	se.bdev = makedev(se.bmajor, 0);
++	devfs_make_node(se.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "emmcroot0");
++	devfs_make_node(makedev(se.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "remmcroot0");
++	se.writable = (rw != 0);
++	se.ready = true;
++	printf("GUAMNA eMMC: \"%s\": first sector 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
++	    want, se.first, se.nsect >> 11, se.writable ? "read-write" : "read-only", se.dma_pa);
++	guamna_log_start();
++	sweet_sample_start();
++	return 0;
++}
++
++/*
++ * Persistent console log, same format and place as sweet_ufs.c's: a 4 KiB
++ * header block ("SWEETLOG" | u32 1 | u32 ring size | u64 total | u64 seq)
++ * then the 4 MiB ring, in the last 1025 4 KiB blocks of the partition.
++ * Boot-args: sweetlog=0 disables, emmclogsecs=N (1-60) sets the interval.
++ */
++#define LOG_BLK                 4096u
++#define LOG_SPB                 (LOG_BLK / EMMC_SECT)
++#define SWEET_LOG_SIZE          (4u << 20)
++#define SWEET_LOG_BLOCKS        (1 + SWEET_LOG_SIZE / LOG_BLK)
++#define SWEET_LOG_SECS          10u
++
++static char sweet_log_ring[SWEET_LOG_SIZE];
++static uint64_t _Atomic sweet_log_total;
++static int sweet_log_chan;
++static uint32_t sweet_log_secs = SWEET_LOG_SECS;
++
++void sweet_log_append(const char *c, int size);
++
++void
++sweet_log_append(const char *c, int size)
++{
++	if (size <= 0) {
++		return;
++	}
++	uint64_t at = os_atomic_add_orig(&sweet_log_total, (uint64_t)size, relaxed);
++	for (int i = 0; i < size; i++) {
++		sweet_log_ring[(at + (uint64_t)i) % SWEET_LOG_SIZE] = c[i];
++	}
++}
++
++struct sweet_log_header {
++	char magic[8];
++	uint32_t version, size;
++	uint64_t total, seq;
++};
++
++static void
++guamna_log_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	/* Block-aligned like `dd bs=4096 skip=size/4096-1025` in sweet-log-pull.sh. */
++	uint64_t base = se.first + (se.nsect / LOG_SPB - SWEET_LOG_BLOCKS) * LOG_SPB;
++	uint64_t flushed = 0, seq = 0;
++	void *bounce = (void *)(se.dma + DMA_BOUNCE);
++
++	printf("GUAMNA LOG: console log to the last %u KiB of the partition (sector 0x%llx)\n",
++	    SWEET_LOG_BLOCKS * LOG_BLK >> 10, base);
++	for (;;) {
++		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
++		uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++		if (total == flushed) {
++			continue;
++		}
++		uint64_t pos = total - flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : flushed;
++		int error = 0;
++
++		lck_mtx_lock(&guamna_emmc_lock);
++		while (pos < total && !error) {
++			uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
++			uint32_t blk = off / LOG_BLK;
++			uint64_t need = ((uint64_t)off % LOG_BLK + (total - pos) + LOG_BLK - 1) / LOG_BLK;
++			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / LOG_BLK - blk)),
++			    (uint64_t)(BOUNCE_SIZE / LOG_BLK));
++			memcpy(bounce, sweet_log_ring + (uint64_t)blk * LOG_BLK, n * LOG_BLK);
++			error = emmc_write(base + (1 + (uint64_t)blk) * LOG_SPB, n * LOG_SPB);
++			pos += (uint64_t)(blk + n) * LOG_BLK - off;
++		}
++		if (!error) {
++			struct sweet_log_header h = {
++				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++				.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ++seq,
++			};
++			bzero(bounce, LOG_BLK);
++			memcpy(bounce, &h, sizeof(h));
++			error = emmc_write(base, LOG_SPB);
++		}
++		if (!error) {
++			error = emmc_flush();
++		}
++		lck_mtx_unlock(&guamna_emmc_lock);
++		if (error) {
++			printf("GUAMNA LOG: write failed (%d), stopping\n", error);
++			return;
++		}
++		flushed = total;
++	}
++}
++
++static void
++guamna_log_start(void)
++{
++	uint32_t on = 1;
++	thread_t thread;
++
++	PE_parse_boot_argn("sweetlog", &on, sizeof(on));
++	if (!on || !se.writable || se.nsect / LOG_SPB < 2 * SWEET_LOG_BLOCKS) {
++		return;
++	}
++	PE_parse_boot_argn("emmclogsecs", &sweet_log_secs, sizeof(sweet_log_secs));
++	if (sweet_log_secs == 0 || sweet_log_secs > 60) {
++		sweet_log_secs = SWEET_LOG_SECS;
++	}
++	if (kernel_thread_start(guamna_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++/* Root device for rd=emmcroot0 (IOFindBSDRoot). */
++int guamna_emmc_rootdev(dev_t *dev);
++
++int
++guamna_emmc_rootdev(dev_t *dev)
++{
++	if (!se.ready) {
++		int error = guamna_emmc_init();
++		if (error) {
++			return error;
++		}
++	}
++	*dev = se.bdev;
++	return 0;
++}
++#endif /* ARM64_BOARD_CONFIG_GUAMNA */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index e6c74aa..b17f6b2 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -766,6 +766,24 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_GUAMNA)
++//
++//	GUAMNA: root on a GPT partition of the internal eMMC (bsd/dev/guamna_emmc.c)
++//
++	if (strcmp(rdBootVar, "emmcroot0") == 0) {
++		extern int guamna_emmc_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int emmc_error = guamna_emmc_rootdev(root);
++		if (emmc_error) {
++			panic("IOFindBSDRoot: GUAMNA eMMC root %s unavailable: %d", rdBootVar, emmc_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
++#endif
++
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ //
+ //	SWEET: root on a GPT partition of the internal UFS (bsd/dev/sweet_ufs.c)
+diff --git a/pexpert/pexpert/arm64/GUAMNA.h b/pexpert/pexpert/arm64/GUAMNA.h
+index 950f9c2..d817111 100644
+--- a/pexpert/pexpert/arm64/GUAMNA.h
++++ b/pexpert/pexpert/arm64/GUAMNA.h
+@@ -29,7 +29,7 @@
+ #define SWEET                     1
+ #define GUAMNA                    1
+ /* 1 once bsd/dev/guamna_emmc.c (patch 0083) provides root storage and the log. */
+-#define GUAMNA_EMMC               0
++#define GUAMNA_EMMC               1
+ 
+ /* 4x A53 (MPIDR 0x000-0x003) + 4x A73 (0x100-0x103), one SMP cluster for XNU. */
+ #define SWEET_SMP_MAX_CPUS        8

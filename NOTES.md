@@ -1,5 +1,15 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+### >>> guamna port (Moto G Play 2021, SM4250), branch `guamna-port`, 2026-11-01 <<<
+- Plan, file inventory and status: `docs/PORTING_GUAMNA.md`.
+- Written, NOT built on macOS or booted: patches 0082 (GUAMNA machine config:
+  4K pages, `-mcpu=cortex-a53`, no PAN, LL/SC commpage, sweet hardware drivers
+  compiled out) and 0083 (`bsd/dev/guamna_emmc.c`, `rd=emmcroot0`);
+  `mkadt.py --board guamna` (STUB addresses); `tools/fdt-survey.py`;
+  `BOARD=guamna shim/build.sh`; CI matrix with an ARMv8.0 instruction guard.
+- Next: live FDT → fdt-survey → real addresses; shim probe boot; first
+  `machine_config=GUAMNA` CI run; check the iOS 16 shared cache for LSE.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<

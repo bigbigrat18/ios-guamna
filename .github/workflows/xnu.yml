@@ -10,7 +10,9 @@ on:
         description: RELEASE / DEVELOPMENT / DEBUG
         default: DEVELOPMENT
       machine_config:
-        description: xnu MACHINE_CONFIG
+        description: xnu MACHINE_CONFIG (SWEET = Redmi Note 10 Pro, GUAMNA = Moto G Play 2021, ALL = both)
+        type: choice
+        options: [SWEET, GUAMNA, ALL]
         default: SWEET
       keep_going:
         description: make -k (collect all compile errors in one run)
@@ -30,10 +32,17 @@ env:
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
   MACOS_VERSION: ${{ inputs.macos_version || '13.5' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
-  MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
 
 jobs:
   build:
+    name: build (${{ matrix.machine }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # push: both boards; workflow_dispatch: the chosen one (or ALL)
+        machine: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.machine_config != 'ALL') && format('["{0}"]', inputs.machine_config) || '["SWEET","GUAMNA"]') }}
+    env:
+      MACHINE_CONFIG: ${{ matrix.machine }}
     # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
     runs-on: macos-14
@@ -48,7 +57,7 @@ jobs:
           git -C dxb checkout -q FETCH_HEAD
           # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
           cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
-          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
+          # libfirehose_kernel is built arm64e-only; the SWEET/GUAMNA kernels are plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
           ls dxb/patches
@@ -92,7 +101,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-buildtree
+          name: ${{ matrix.machine == 'SWEET' && 'xnu-buildtree' || 'xnu-buildtree-guamna' }}
           path: buildtree.tgz
           retention-days: 7
 
@@ -116,9 +125,32 @@ jobs:
           ls -la out
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
+      # guamna's Cortex-A53/A73 are ARMv8.0: any LSE atomic (ARMv8.1), RCpc
+      # load (ARMv8.3), STLUR (ARMv8.4) or PAN access in the kernel is an
+      # UNDEFINED instruction on the phone. Fail here instead of on the device.
+      - name: ARMv8.0 instruction guard (GUAMNA)
+        if: matrix.machine == 'GUAMNA'
+        run: |
+          shopt -s nullglob
+          kernels=(out/kernel.*.guamna)
+          [ ${#kernels[@]} -gt 0 ] || { echo "no guamna kernel built"; exit 1; }
+          bad='[[:space:]](cas(p)?(a|al|l)?[bh]?|ld(add|clr|eor|set|smax|smin|umax|umin)(a|al|l)?[bh]?|st(add|clr|eor|set|smax|smin|umax|umin)l?[bh]?|swp(a|al|l)?[bh]?|ldapr[bh]?|ldapur[a-z]*|stlur[bh]?)[[:space:]]|msr[[:space:]]+pan'
+          status=0
+          for k in "${kernels[@]}"; do
+            xcrun otool -tvV "$k" > "$k.dis"
+            n=$(grep -Eic "$bad" "$k.dis" || true)
+            echo "$k: $(wc -l < "$k.dis") instructions, $n not ARMv8.0, $(grep -c 'ldaxr' "$k.dis" || true) ldaxr"
+            if [ "$n" != 0 ]; then
+              grep -Ei -B2 "$bad" "$k.dis" | head -60
+              status=1
+            fi
+            rm -f "$k.dis"
+          done
+          exit $status
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-kernel
+          name: ${{ matrix.machine == 'SWEET' && 'xnu-kernel' || 'xnu-kernel-guamna' }}
           path: out/
           if-no-files-found: warn
