@@ -81,15 +81,16 @@ index 24f1abc..4170c1b 100644
  		return; /* spurious */
  	}
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
-index 6089db9..a7cb37e 100644
+index 6089db9..fd5e1fe 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
-@@ -73,6 +73,39 @@ find_gicr_pe_base()
+@@ -73,6 +73,40 @@ find_gicr_pe_base()
  	panic("%s: cannot find GICR base for core %u", __func__, ml_get_cpu_number(phys_id));
  }
  
 +#if defined(GUAMNA)
 +/* Bring-up: the same state as one short string, for a panic message. */
++extern int snprintf(char *, size_t, const char *, ...) __printflike(3, 4);
 +void sweet_gic_diag_str(char *buf, unsigned long len);
 +void
 +sweet_gic_diag_str(char *buf, unsigned long len)
