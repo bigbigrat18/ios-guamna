@@ -15,10 +15,10 @@ on:
         options: [SWEET, GUAMNA, ALL]
         default: SWEET
       runner:
-        description: macOS runner. macos-14 (Xcode 15, known good) retires 2026-11-02; macos-15 has only Xcode 16+ (iig IORPC ABI mismatch, being worked on)
+        description: macOS runner. macos-15 = Xcode 16 (needs patch 0084); macos-14 = Xcode 15, retired 2026-11-02
         type: choice
         options: [macos-14, macos-15]
-        default: macos-14
+        default: macos-15
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
@@ -48,9 +48,9 @@ jobs:
         machine: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.machine_config != 'ALL') && format('["{0}"]', inputs.machine_config) || '["SWEET","GUAMNA"]') }}
     env:
       MACHINE_CONFIG: ${{ matrix.machine }}
-    # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
-    # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: ${{ inputs.runner || 'macos-14' }}
+    # macos-14 shipped Xcode 15 (iig matched xnu-8796); it retired 2026-11-02.
+    # Xcode 16 iig emits IORPC.kernelContent: patch 0084 backports the field.
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
