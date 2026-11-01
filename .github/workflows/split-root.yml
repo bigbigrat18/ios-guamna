@@ -1,0 +1,137 @@
+name: split-root
+
+# Re-uploads an ios16-root-simg artifact as ~1 GB sparse parts, each its own
+# artifact, so slow or per-connection-capped downloads can run in parallel
+# (and fit on FAT32). simg2simg parts are independent sparse images of the
+# whole partition; flash them in order:
+#   fastboot flash userdata ios16-root.simg.1 ... (one command per part)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: iosroot run holding the ios16-root-simg artifact
+        default: "41343389800"
+      artifact:
+        default: ios16-root-simg
+      part_size:
+        description: max bytes per part (simg2simg)
+        default: "1000000000"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  split:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      W: /mnt/work
+    steps:
+      - name: Download and split
+        run: |
+          sudo mkdir -p "$W" && sudo chown "$USER" "$W"
+          sudo apt-get update -qq && sudo apt-get install -y -qq android-sdk-libsparse-utils
+          gh run download "${{ inputs.run_id }}" -R "$GITHUB_REPOSITORY" -n "${{ inputs.artifact }}" -D "$W/in"
+          ls -l "$W/in"
+          sha256sum "$W/in/ios16-root.simg"
+          mkdir -p "$W/out"
+          simg2simg "$W/in/ios16-root.simg" "$W/out/ios16-root.simg" "${{ inputs.part_size }}"
+          rm -rf "$W/in"
+          cd "$W/out" && ls -l
+          n=$(ls ios16-root.simg.* | wc -l); echo "parts: $n"
+          # simg2simg numbers parts from 0; artifacts are root-part-1.. in flash order
+          k=0
+          for f in $(ls ios16-root.simg.* | sort -t. -k3 -n); do
+            k=$((k+1)); mkdir -p "p$k"; mv "$f" "p$k/ios16-root-part$k.simg"
+          done
+          sha256sum p*/*.simg | tee SHA256SUMS
+          for d in p*; do cp SHA256SUMS "$d/"; done
+          ls -lR
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: root-part-1
+          path: /mnt/work/out/p1/
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: root-part-2
+          path: /mnt/work/out/p2/
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: root-part-3
+          path: /mnt/work/out/p3/
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: root-part-4
+          path: /mnt/work/out/p4/
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: root-part-5
+          path: /mnt/work/out/p5/
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: root-part-6
+          path: /mnt/work/out/p6/
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: root-part-7
+          path: /mnt/work/out/p7/
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: root-part-8
+          path: /mnt/work/out/p8/
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: root-part-9
+          path: /mnt/work/out/p9/
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: root-part-10
+          path: /mnt/work/out/p10/
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: root-part-11
+          path: /mnt/work/out/p11/
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: root-part-12
+          path: /mnt/work/out/p12/
+          retention-days: 3
+          compression-level: 0
+          if-no-files-found: ignore
