@@ -1,0 +1,653 @@
+diff --git a/bsd/dev/guamna_emmc.c b/bsd/dev/guamna_emmc.c
+index 798129c..a995682 100644
+--- a/bsd/dev/guamna_emmc.c
++++ b/bsd/dev/guamna_emmc.c
+@@ -1,13 +1,15 @@
+ /*
+  * GUAMNA internal eMMC root device (Moto G Play 2021, SM4250 SDHC1).
+  *
+- * The eMMC 5.1 card behind Qualcomm's sdhci-msm v5 controller is left
+- * initialized by ABL, which loaded our boot image from it: clocks, bus width,
+- * HS200/HS400 timing and tuning are all set up and the card is selected. Like
+- * sweet_ufs.c does for UFS, this driver only reuses that state. It never
+- * touches clocks, power or HOST_CONTROL2 (on sdhci-msm those writes raise a
+- * power-IRQ handshake that only a full driver can answer). It:
+- *   - finds the card's RCA with CMD13 and selects it (CMD7) if needed,
++ * Motorola's ABL resets the SDHC before jumping to the kernel (first test:
++ * host ctrl 0, ctrl2 0, card silent), so unless the card still answers CMD13
++ * this driver brings it up itself, the way Linux sdhci-msm does: GCC SDCC1
++ * branch clocks on, SDHCI reset, msm power-IRQ handshake acked by polling
++ * (PWRCTL status/clear/ctl), 1.8 V bus power, 400 kHz identification
++ * (CMD0/1/2/3), CMD7, then 8-bit bus and High Speed 52 MHz (boot-arg
++ * emmcspeed=0 1-bit 25 MHz, 1 8-bit 25 MHz, 2 8-bit 52 MHz: default), each
++ * verified with an EXT_CSD read and backed off on failure. It:
++ *   - selects the card (CMD7),
+  *   - reads EXT_CSD (CMD8), switches to the user area and turns command
+  *     queueing off if ABL left either set (CMD6),
+  *   - issues polled CMD18/CMD25 (Auto CMD12) through ADMA2, one at a time,
+@@ -21,9 +23,10 @@
+  * The controller is not cache coherent: the bounce buffer and descriptors
+  * are cleaned/invalidated around each command.
+  *
+- * UNTESTED ON HARDWARE. Register offsets are standard SDHCI 3.0/4.x.
++ * Register offsets are standard SDHCI 3.0/4.x plus sdhci-msm v5 vendor ones.
+  */
+ #if defined(ARM64_BOARD_CONFIG_GUAMNA)
++#include <stdarg.h>
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/buf.h>
+@@ -61,6 +64,9 @@ extern void sweet_sample_start(void);
+ #define SD_RESP3        0x1c    /* Auto CMD12 response lands here */
+ #define SD_PRESENT      0x24
+ #define SD_HOST_CTRL    0x28    /* 8-bit */
++#define SD_PWR_CTRL     0x29    /* 8-bit */
++#define SD_CLK_CTRL     0x2c    /* 16-bit */
++#define SD_TIMEOUT_CTRL 0x2e    /* 8-bit */
+ #define SD_SW_RESET     0x2f    /* 8-bit */
+ #define SD_INT_STATUS   0x30    /* [15:0] normal, [31:16] error */
+ #define SD_INT_ENABLE   0x34
+@@ -72,12 +78,55 @@ extern void sweet_sample_start(void);
+ #define SD_ADMA_HI      0x5c
+ #define SD_VERSION      0xfc    /* upper 16 bits */
+ 
++/* sdhci-msm v5 vendor registers, in the same "hc" region */
++#define MSM_DLL_CONFIG          0x200
++#define MSM_VENDOR_SPEC         0x20c
++#define MSM_PWRCTL_STATUS       0x240
++#define MSM_PWRCTL_CLEAR        0x248
++#define MSM_PWRCTL_CTL          0x24c
++#define MSM_VENDOR_SPEC3        0x250
++#define MSM_VENDOR_SPEC_POR     0xa9cu
++#define MSM_IO_PAD_SWITCH_EN    (1u << 15)
++#define MSM_IO_PAD_SWITCH       (1u << 16)      /* pads at 1.8 V */
++#define MSM_PWRSAVE_DLL         (1u << 3)
++#define MSM_DLL_PDN             (1u << 29)
++#define MSM_DLL_RST             (1u << 30)
++#define MSM_PWR_BUS_OFF         (1u << 0)
++#define MSM_PWR_BUS_ON          (1u << 1)
++#define MSM_PWR_IO_LOW          (1u << 2)
++#define MSM_PWR_IO_HIGH         (1u << 3)
++#define MSM_PWR_BUS_SUCCESS     (1u << 0)
++#define MSM_PWR_IO_SUCCESS      (1u << 2)
++
++/* GCC SDCC1 (drivers/clk/qcom/gcc-sm6115.c), page at 0x01438000 */
++#define GCC_SDCC1_PA            0x01438000u
++#define GCC_SDCC1_APPS_CBCR     0x004
++#define GCC_SDCC1_AHB_CBCR      0x008
++#define GCC_SDCC1_RCG_CMD       0x028
++#define GCC_SDCC1_RCG_CFG       0x02c
++#define GCC_SDCC1_RCG_M         0x030
++#define GCC_SDCC1_RCG_N         0x034
++#define CBCR_OFF                (1u << 31)
++#define RCG_ROOT_OFF            (1u << 31)
++#define RCG_UPDATE              (1u << 0)
++
+ #define PS_CMD_INHIBIT  (1u << 0)
+ #define PS_DAT_INHIBIT  (1u << 1)
+ #define PS_DAT0         (1u << 20)
+ 
++#define HC_4BIT         (1u << 1)
++#define HC_HISPD        (1u << 2)
+ #define HC_DMA_MASK     (3u << 3)
+ #define HC_DMA_ADMA2    (2u << 3)
++#define HC_8BIT         (1u << 5)
++
++#define CLK_INT_EN      (1u << 0)
++#define CLK_INT_STABLE  (1u << 1)
++#define CLK_SD_EN       (1u << 2)
++
++#define PWR_ON_1V8      ((5u << 1) | 1u)
++
++#define HC2_1V8         (1u << 3)
+ 
+ #define HC2_V4_ENABLE   (1u << 12)
+ #define HC2_64BIT_ADDR  (1u << 13)
+@@ -89,6 +138,7 @@ extern void sweet_sample_start(void);
+ #define IS_ERROR        (1u << 15)
+ #define IS_ERR_SHIFT    16
+ 
++#define RST_ALL         (1u << 0)
+ #define RST_CMD         (1u << 1)
+ #define RST_DAT         (1u << 2)
+ 
+@@ -99,6 +149,8 @@ extern void sweet_sample_start(void);
+ #define TM_MULTI        (1u << 5)
+ 
+ #define CMD_RESP_NONE   0x00u
++#define CMD_RESP_R2     0x09u   /* 136 bit, CRC check */
++#define CMD_RESP_R3     0x02u   /* 48 bit, no checks (OCR) */
+ #define CMD_RESP_R1     0x1au   /* 48 bit, CRC + index check */
+ #define CMD_RESP_R1B    0x1bu   /* 48 bit busy, CRC + index check */
+ #define CMD_DATA        0x20u
+@@ -119,12 +171,16 @@ extern void sweet_sample_start(void);
+ #define EXT_CSD_FLUSH_CACHE     32
+ #define EXT_CSD_CACHE_CTRL      33
+ #define EXT_CSD_PART_CONFIG     179
++#define EXT_CSD_BUS_WIDTH       183
++#define EXT_CSD_HS_TIMING       185
+ #define EXT_CSD_SEC_COUNT       212
+ 
+ #define EMMC_SECT       512u
+ #define BOUNCE_SIZE     (1u << 20)
+ #define DESC_MAX        (BOUNCE_SIZE / ADMA_CHUNK)
+ #define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
++#define PROBE_TIMEOUT_NS (50ull * NSEC_PER_MSEC)
++#define EMMC_RCA        2u
+ 
+ /* Layout of the contiguous DMA allocation. */
+ #define DMA_DESC        0x0000          /* <= DESC_MAX * 16 bytes */
+@@ -132,7 +188,9 @@ extern void sweet_sample_start(void);
+ #define DMA_SIZE        (DMA_BOUNCE + BOUNCE_SIZE)
+ 
+ static struct {
+-	vm_offset_t regs, cqhci;
++	vm_offset_t regs, cqhci, gcc;
++	uint64_t tmo_ns;                        /* per-command timeout */
++	uint32_t base_hz, sd_hz;                /* GCC apps clock, SD clock */
+ 	vm_offset_t dma;
+ 	uint64_t dma_pa;
+ 	unsigned desc_size;                     /* 8 (32-bit), 12 (v3 64-bit), 16 (v4 64-bit) */
+@@ -162,6 +220,65 @@ wr32(uint32_t off, uint32_t v)
+ 	*(volatile uint32_t *)(se.regs + off) = v;
+ }
+ 
++static inline uint16_t
++rd16(uint32_t off)
++{
++	return *(volatile uint16_t *)(se.regs + off);
++}
++
++static inline void
++wr16(uint32_t off, uint16_t v)
++{
++	*(volatile uint16_t *)(se.regs + off) = v;
++}
++
++static inline uint32_t
++gcc_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(se.gcc + off);
++}
++
++static inline void
++gcc_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(se.gcc + off) = v;
++}
++
++/*
++ * Short trail of what bring-up saw, for the root-device panic string: the
++ * panic report scrolls the printf lines off the screen.
++ */
++static char emmc_diag_buf[384];
++
++static void
++diag(const char *fmt, ...) __printflike(1, 2);
++
++static void
++diag(const char *fmt, ...)
++{
++	size_t used = strlen(emmc_diag_buf);
++	va_list ap;
++	if (used + 2 >= sizeof(emmc_diag_buf)) {
++		return;
++	}
++	if (used) {
++		emmc_diag_buf[used++] = ';';
++		emmc_diag_buf[used++] = ' ';
++		emmc_diag_buf[used] = 0;
++	}
++	va_start(ap, fmt);
++	vsnprintf(emmc_diag_buf + used, sizeof(emmc_diag_buf) - used, fmt, ap);
++	va_end(ap);
++}
++
++const char *guamna_emmc_diag(void);
++
++const char *
++guamna_emmc_diag(void)
++{
++	return emmc_diag_buf;
++}
++
+ static inline uint8_t
+ rd8(uint32_t off)
+ {
+@@ -261,7 +378,7 @@ emmc_cmd(uint32_t idx, uint32_t arg, uint32_t resp, uint32_t nblk, bool write, b
+ {
+ 	uint32_t len = nblk * EMMC_SECT;
+ 	uint32_t inhibit = PS_CMD_INHIBIT | ((nblk || resp == CMD_RESP_R1B) ? PS_DAT_INHIBIT : 0);
+-	uint64_t dl = deadline_in(CMD_TIMEOUT_NS);
++	uint64_t dl = deadline_in(se.tmo_ns ? se.tmo_ns : CMD_TIMEOUT_NS);
+ 	uint32_t is = 0, mode = 0;
+ 	int error;
+ 
+@@ -298,9 +415,11 @@ emmc_cmd(uint32_t idx, uint32_t arg, uint32_t resp, uint32_t nblk, bool write, b
+ 		error = emmc_wait(IS_XFER_DONE, dl, &is);
+ 	}
+ 	if (error) {
+-		if (idx != 13) {        /* CMD13 timeouts are expected while probing the RCA */
++		if (idx != 13 || !se.tmo_ns) {  /* CMD13 timeouts are expected while probing */
+ 			printf("GUAMNA eMMC: CMD%u arg 0x%x: %s, status 0x%08x adma 0x%x\n", idx, arg,
+ 			    error == ETIMEDOUT ? "timeout" : "error", is, rd8(SD_ADMA_ERR));
++			diag("CMD%u %s is 0x%x ps 0x%x", idx, error == ETIMEDOUT ? "tmo" : "err", is,
++			    rd32(SD_PRESENT));
+ 		}
+ 		emmc_reset_lines();
+ 		return error;
+@@ -312,7 +431,8 @@ emmc_cmd(uint32_t idx, uint32_t arg, uint32_t resp, uint32_t nblk, bool write, b
+ 	if (r1) {
+ 		*r1 = status;
+ 	}
+-	if (resp != CMD_RESP_NONE && (status & R1_ERRORS)) {
++	uint32_t rt = resp & ~CMD_DATA;
++	if ((rt == CMD_RESP_R1 || rt == CMD_RESP_R1B) && (status & R1_ERRORS)) {
+ 		printf("GUAMNA eMMC: CMD%u arg 0x%x: card status 0x%08x\n", idx, arg, status);
+ 		return EIO;
+ 	}
+@@ -367,13 +487,17 @@ emmc_flush(void)
+ 	return se.cache_on ? emmc_switch(EXT_CSD_FLUSH_CACHE, 1) : 0;
+ }
+ 
+-/* Find the RCA ABL assigned and make sure the card is selected (TRAN). */
+-static int
+-emmc_find_card(uint32_t rca_hint)
++/* Did ABL leave the card selected and the host usable? CMD13 at RCA 1-3. */
++static bool
++emmc_probe_card(uint32_t rca_hint)
+ {
+ 	uint32_t cand[] = { rca_hint, 2, 1, 3 };
+ 	uint32_t r1 = 0;
+ 
++	if (!(rd16(SD_CLK_CTRL) & CLK_SD_EN)) {
++		return false;
++	}
++	se.tmo_ns = PROBE_TIMEOUT_NS;
+ 	for (unsigned i = 0; i < sizeof(cand) / sizeof(cand[0]); i++) {
+ 		if (cand[i] == 0 || (i > 0 && cand[i] == rca_hint)) {
+ 			continue;
+@@ -383,22 +507,241 @@ emmc_find_card(uint32_t rca_hint)
+ 			break;
+ 		}
+ 	}
++	se.tmo_ns = 0;
+ 	if (!se.rca) {
+-		printf("GUAMNA eMMC: no card answers CMD13 (tried RCA %u, 2, 1, 3)\n", rca_hint);
+-		return ENXIO;
++		printf("GUAMNA eMMC: no card answers CMD13 with ABL's host state\n");
++		return false;
+ 	}
+ 	printf("GUAMNA eMMC: RCA %u, state %u\n", se.rca, R1_STATE(r1));
+ 	if (R1_STATE(r1) == R1_STATE_STBY) {
+-		int error = emmc_cmd(7, se.rca << 16, CMD_RESP_R1B, 0, false, false, NULL);
+-		if (error) {
+-			return error;
++		if (emmc_cmd(7, se.rca << 16, CMD_RESP_R1B, 0, false, false, NULL) != 0) {
++			se.rca = 0;
++			return false;
+ 		}
+ 	} else if (R1_STATE(r1) != R1_STATE_TRAN) {
+-		return EIO;
++		se.rca = 0;
++		return false;
++	}
++	diag("ABL card RCA %u", se.rca);
++	return true;
++}
++
++/* Ack sdhci-msm power IRQs (bus on/off, IO level) the way Linux does, polled. */
++static uint32_t
++msm_pwr_ack(uint64_t wait_ns)
++{
++	uint64_t dl = deadline_in(wait_ns);
++	uint32_t st;
++
++	while (!((st = rd32(MSM_PWRCTL_STATUS) & 0xf)) && !timed_out(dl)) {
++		delay(10);
++	}
++	if (!st) {
++		return 0;
++	}
++	for (int retry = 10; retry > 0; retry--) {
++		wr32(MSM_PWRCTL_CLEAR, st);
++		if (!(rd32(MSM_PWRCTL_STATUS) & st)) {
++			break;
++		}
++		delay(10);
++	}
++	uint32_t ack = 0;
++	if (st & (MSM_PWR_BUS_ON | MSM_PWR_BUS_OFF)) {
++		ack |= MSM_PWR_BUS_SUCCESS;
++	}
++	if (st & (MSM_PWR_BUS_ON | MSM_PWR_BUS_OFF | MSM_PWR_IO_LOW | MSM_PWR_IO_HIGH)) {
++		ack |= MSM_PWR_IO_SUCCESS;
++	}
++	wr32(MSM_PWRCTL_CTL, ack);
++	/* eMMC VCCQ is 1.8 V only: keep the pads at 1.8 V whatever was asked. */
++	wr32(MSM_VENDOR_SPEC, rd32(MSM_VENDOR_SPEC) | MSM_IO_PAD_SWITCH_EN | MSM_IO_PAD_SWITCH);
++	return st;
++}
++
++/* GCC SDCC1 clocks: branches on, root rate (programs 50 MHz if the root is off). */
++static uint32_t
++gcc_sdcc1_rate(void)
++{
++	uint32_t cfg = gcc_rd(GCC_SDCC1_RCG_CFG);
++	uint32_t src = (cfg >> 8) & 7, hid = cfg & 0x1f, mode = (cfg >> 12) & 3;
++	uint64_t parent;
++
++	switch (src) {
++	case 0: parent = 19200000; break;       /* bi_tcxo */
++	case 1: parent = 600000000; break;      /* gpll0_out_early */
++	case 2: parent = 300000000; break;      /* gpll0_out_aux2 */
++	case 4: parent = 384000000; break;      /* gpll6_out_main */
++	default: return 0;
++	}
++	uint64_t rate = hid ? parent * 2 / (hid + 1) : parent;
++	if (mode) {
++		uint32_t m = gcc_rd(GCC_SDCC1_RCG_M) & 0xff;
++		uint32_t n = ((~gcc_rd(GCC_SDCC1_RCG_N)) & 0xff) + m;
++		if (!m || !n) {
++			return 0;
++		}
++		rate = rate * m / n;
++	}
++	return (uint32_t)rate;
++}
++
++static int
++gcc_sdcc1_on(void)
++{
++	uint32_t cmd = gcc_rd(GCC_SDCC1_RCG_CMD), cfg = gcc_rd(GCC_SDCC1_RCG_CFG);
++	uint32_t apps = gcc_rd(GCC_SDCC1_APPS_CBCR), ahb = gcc_rd(GCC_SDCC1_AHB_CBCR);
++
++	diag("gcc rcg 0x%x/0x%x apps 0x%x ahb 0x%x", cmd, cfg, apps, ahb);
++	if ((cmd & RCG_ROOT_OFF) || gcc_sdcc1_rate() == 0) {
++		/* 50 MHz: gpll0_out_aux2 (300 MHz) / 6, no M/N, like Linux's table */
++		gcc_wr(GCC_SDCC1_RCG_CFG, (2u << 8) | (2 * 6 - 1));
++		gcc_wr(GCC_SDCC1_RCG_CMD, gcc_rd(GCC_SDCC1_RCG_CMD) | RCG_UPDATE);
++		uint64_t dl = deadline_in(10 * NSEC_PER_MSEC);
++		while ((gcc_rd(GCC_SDCC1_RCG_CMD) & RCG_UPDATE) && !timed_out(dl)) {
++			delay(1);
++		}
++		diag("rcg -> 50MHz cmd 0x%x", gcc_rd(GCC_SDCC1_RCG_CMD));
++	}
++	gcc_wr(GCC_SDCC1_AHB_CBCR, gcc_rd(GCC_SDCC1_AHB_CBCR) | 1);
++	gcc_wr(GCC_SDCC1_APPS_CBCR, gcc_rd(GCC_SDCC1_APPS_CBCR) | 1);
++	uint64_t dl = deadline_in(10 * NSEC_PER_MSEC);
++	while (((gcc_rd(GCC_SDCC1_APPS_CBCR) | gcc_rd(GCC_SDCC1_AHB_CBCR)) & CBCR_OFF) && !timed_out(dl)) {
++		delay(1);
++	}
++	se.base_hz = gcc_sdcc1_rate();
++	if ((gcc_rd(GCC_SDCC1_APPS_CBCR) & CBCR_OFF) || !se.base_hz) {
++		diag("sdcc1 clock off: apps 0x%x rate %u", gcc_rd(GCC_SDCC1_APPS_CBCR), se.base_hz);
++		return ENXIO;
++	}
++	return 0;
++}
++
++/* SD clock <= hz from the GCC rate with the SDHCI 10-bit divider. */
++static int
++emmc_set_clock(uint32_t hz)
++{
++	uint32_t n = 0;
++	if (se.base_hz > hz) {
++		n = (se.base_hz + 2 * hz - 1) / (2 * hz);
++		if (n > 1023) {
++			n = 1023;
++		}
+ 	}
++	wr16(SD_CLK_CTRL, 0);
++	wr16(SD_CLK_CTRL, (uint16_t)(((n & 0xff) << 8) | (((n >> 8) & 3) << 6) | CLK_INT_EN));
++	uint64_t dl = deadline_in(20 * NSEC_PER_MSEC);
++	while (!(rd16(SD_CLK_CTRL) & CLK_INT_STABLE)) {
++		if (timed_out(dl)) {
++			diag("clock not stable 0x%x", rd16(SD_CLK_CTRL));
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	wr16(SD_CLK_CTRL, rd16(SD_CLK_CTRL) | CLK_SD_EN);
++	se.sd_hz = n ? se.base_hz / (2 * n) : se.base_hz;
++	delay(1000);    /* >= 74 card clocks even at 100 kHz */
+ 	return 0;
+ }
+ 
++/* Full bring-up from a reset host, as Linux sdhci-msm + mmc core would. */
++static int
++emmc_full_init(void)
++{
++	int error;
++	uint32_t r = 0, st;
++
++	if ((error = gcc_sdcc1_on())) {
++		return error;
++	}
++	wr8(SD_SW_RESET, RST_ALL);
++	uint64_t dl = deadline_in(100 * NSEC_PER_MSEC);
++	while (rd8(SD_SW_RESET) & RST_ALL) {
++		if (timed_out(dl)) {
++			diag("RESET_ALL stuck");
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	st = msm_pwr_ack(20 * NSEC_PER_MSEC);
++
++	/* Vendor defaults for <= 100 MHz: POR value, 1.8 V pads, DLL off. */
++	wr32(MSM_VENDOR_SPEC, MSM_VENDOR_SPEC_POR | MSM_IO_PAD_SWITCH_EN | MSM_IO_PAD_SWITCH);
++	wr32(MSM_VENDOR_SPEC3, rd32(MSM_VENDOR_SPEC3) & ~MSM_PWRSAVE_DLL);
++	wr32(MSM_DLL_CONFIG, rd32(MSM_DLL_CONFIG) | MSM_DLL_RST);
++	wr32(MSM_DLL_CONFIG, rd32(MSM_DLL_CONFIG) | MSM_DLL_PDN);
++	if (se.cqhci) {
++		*(volatile uint32_t *)(se.cqhci + 0x08) = 0;    /* CQCFG: engine off */
++	}
++
++	wr32(SD_SIG_ENABLE, 0);
++	wr32(SD_INT_ENABLE, 0x03ff000bu);
++	wr32(SD_INT_STATUS, 0xffffffffu);
++	wr8(SD_TIMEOUT_CTRL, 0xe);
++	wr8(SD_HOST_CTRL, HC_DMA_ADMA2);                /* 1-bit, normal speed */
++	wr8(SD_PWR_CTRL, PWR_ON_1V8);
++	st |= msm_pwr_ack(20 * NSEC_PER_MSEC) << 4;
++	wr16(SD_HOST_CTRL2 + 2, HC2_1V8);
++	st |= msm_pwr_ack(5 * NSEC_PER_MSEC) << 8;
++	if ((error = emmc_set_clock(400000))) {
++		return error;
++	}
++	diag("base %u Hz pwrirq 0x%x pwr 0x%x", se.base_hz, st, rd8(SD_PWR_CTRL));
++
++	se.tmo_ns = 100 * NSEC_PER_MSEC;
++	error = emmc_cmd(0, 0, CMD_RESP_NONE, 0, false, false, NULL);
++	delay(2000);
++	dl = deadline_in(2 * NSEC_PER_SEC);
++	do {
++		/* sector mode, 1.70-1.95 V */
++		error = emmc_cmd(1, 0x40000080u, CMD_RESP_R3, 0, false, false, &r);
++		if (!error && (r & 0x80000000u)) {
++			break;
++		}
++		delay(10000);
++	} while (!timed_out(dl));
++	if (error || !(r & 0x80000000u)) {
++		diag("CMD1 %s ocr 0x%x", error ? "failed" : "busy", r);
++		se.tmo_ns = 0;
++		return error ? error : ETIMEDOUT;
++	}
++	diag("ocr 0x%x", r);
++	error = emmc_cmd(2, 0, CMD_RESP_R2, 0, false, false, NULL);
++	if (!error) {
++		error = emmc_cmd(3, EMMC_RCA << 16, CMD_RESP_R1, 0, false, false, NULL);
++	}
++	se.tmo_ns = 0;
++	if (error) {
++		diag("CMD2/3 failed %d", error);
++		return error;
++	}
++	se.rca = EMMC_RCA;
++	if ((error = emmc_set_clock(25000000))) {
++		return error;
++	}
++	error = emmc_cmd(7, se.rca << 16, CMD_RESP_R1B, 0, false, false, NULL);
++	if (!error) {
++		error = emmc_cmd(13, se.rca << 16, CMD_RESP_R1, 0, false, false, &r);
++	}
++	if (error || R1_STATE(r) != R1_STATE_TRAN) {
++		diag("select failed %d state %u", error, R1_STATE(r));
++		return error ? error : EIO;
++	}
++	printf("GUAMNA eMMC: card up from reset, RCA %u, SD clock %u Hz (base %u)\n",
++	    se.rca, se.sd_hz, se.base_hz);
++	return 0;
++}
++
++static int
++emmc_find_card(uint32_t rca_hint)
++{
++	if (emmc_probe_card(rca_hint)) {
++		return 0;
++	}
++	se.rca = 0;
++	return emmc_full_init();
++}
++
+ static int
+ emmc_ext_csd(void)
+ {
+@@ -416,6 +759,7 @@ emmc_ext_csd(void)
+ 	    e[192], se.card_sectors >> 11, part, cmdq, se.cache_on);
+ 	/* Sector addressing (high capacity) is all this driver speaks. */
+ 	if (se.card_sectors <= (2ull << 30) / EMMC_SECT) {
++		diag("EXT_CSD sectors %llu", se.card_sectors);
+ 		return ENXIO;
+ 	}
+ 	if (cmdq & 1) {
+@@ -430,6 +774,39 @@ emmc_ext_csd(void)
+ 	return error;
+ }
+ 
++/* 8-bit bus, then High Speed 52 MHz; each checked with an EXT_CSD read. */
++static void
++emmc_speed_up(uint32_t level)
++{
++	uint8_t hc = rd8(SD_HOST_CTRL);
++
++	if (level >= 1) {
++		if (emmc_switch(EXT_CSD_BUS_WIDTH, 2) == 0) {
++			wr8(SD_HOST_CTRL, (uint8_t)((hc & ~HC_4BIT) | HC_8BIT));
++			if (emmc_cmd(8, 0, CMD_RESP_R1, 1, false, false, NULL) != 0) {
++				wr8(SD_HOST_CTRL, hc);
++				(void)emmc_switch(EXT_CSD_BUS_WIDTH, 0);
++				diag("8-bit failed");
++				level = 0;
++			}
++		} else {
++			level = 0;
++		}
++	}
++	if (level >= 2 && emmc_switch(EXT_CSD_HS_TIMING, 1) == 0) {
++		uint8_t hc8 = rd8(SD_HOST_CTRL);
++		wr8(SD_HOST_CTRL, hc8 | HC_HISPD);
++		if (emmc_set_clock(52000000) != 0 ||
++		    emmc_cmd(8, 0, CMD_RESP_R1, 1, false, false, NULL) != 0) {
++			(void)emmc_set_clock(25000000);
++			wr8(SD_HOST_CTRL, hc8);
++			(void)emmc_switch(EXT_CSD_HS_TIMING, 0);
++			diag("HS52 failed");
++		}
++	}
++	printf("GUAMNA eMMC: %u-bit bus, %u Hz\n", (rd8(SD_HOST_CTRL) & HC_8BIT) ? 8 : 1, se.sd_hz);
++}
++
+ static int
+ emmc_find_partition(const char *want)
+ {
+@@ -440,6 +817,7 @@ emmc_find_partition(const char *want)
+ 	}
+ 	if (memcmp(b, "EFI PART", 8) != 0) {
+ 		printf("GUAMNA eMMC: no GPT\n");
++		diag("no GPT");
+ 		return ENXIO;
+ 	}
+ 	uint64_t entry_lba;
+@@ -474,6 +852,7 @@ emmc_find_partition(const char *want)
+ 		memcpy(&first, e + 32, 8);
+ 		memcpy(&last, e + 40, 8);
+ 		if (last < first || last >= se.card_sectors) {
++			diag("bad GPT entry %s", name);
+ 			return ENXIO;
+ 		}
+ 		se.first = first;
+@@ -494,7 +873,8 @@ emmc_take_over_host(void)
+ 		uint32_t cqcfg = *(volatile uint32_t *)(se.cqhci + 0x08);
+ 		if (cqcfg & 1) {
+ 			printf("GUAMNA eMMC: ABL left the command queue engine on (CQCFG 0x%x)\n", cqcfg);
+-			return EBUSY;
++			diag("cqcfg 0x%x", cqcfg);
++			*(volatile uint32_t *)(se.cqhci + 0x08) = 0;
+ 		}
+ 	}
+ 	if (!(caps & CAP_ADMA2)) {
+@@ -512,6 +892,8 @@ emmc_take_over_host(void)
+ 	}
+ 	printf("GUAMNA eMMC: SDHCI spec %u, host ctrl 0x%x, ctrl2 0x%x, caps 0x%x, present 0x%x\n",
+ 	    (ver & 0xff) + 1, rd8(SD_HOST_CTRL), hc2, caps, rd32(SD_PRESENT));
++	diag("hc 0x%x clk 0x%x pwr 0x%x vs 0x%x", rd8(SD_HOST_CTRL), rd16(SD_CLK_CTRL),
++	    rd8(SD_PWR_CTRL), rd32(MSM_VENDOR_SPEC));
+ 
+ 	wr32(SD_SIG_ENABLE, 0);                 /* polled: no interrupt lines */
+ 	wr32(SD_INT_ENABLE, 0x03ff000bu);       /* status latches: cmd/xfer/dma done, all errors */
+@@ -728,20 +1110,23 @@ guamna_emmc_init(void)
+ 	uintptr_t const *reg = NULL;
+ 	unsigned int size = 0;
+ 	char want[64] = "userdata";
+-	uint32_t rw = 0, rca = 0;
++	uint32_t rw = 0, rca = 0, speed = 2;
+ 	int error;
+ 
+ 	if (SecureDTLookupEntry(NULL, "/guamna-emmc", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+ 	    size < 2 * sizeof(uintptr_t)) {
+ 		printf("GUAMNA eMMC: no /guamna-emmc node in the device tree\n");
++		diag("no /guamna-emmc node");
+ 		return ENXIO;
+ 	}
+ 	PE_parse_boot_argn("emmcroot", want, sizeof(want));
+ 	PE_parse_boot_argn("emmcrw", &rw, sizeof(rw));
+ 	PE_parse_boot_argn("emmcrca", &rca, sizeof(rca));
++	PE_parse_boot_argn("emmcspeed", &speed, sizeof(speed));
+ 
+ 	se.regs = ml_io_map(reg[0], reg[1]);
++	se.gcc = ml_io_map(GCC_SDCC1_PA, PAGE_SIZE);
+ 	if (size >= 4 * sizeof(uintptr_t)) {
+ 		se.cqhci = ml_io_map(reg[2], reg[3]);
+ 	}
+@@ -765,6 +1150,9 @@ guamna_emmc_init(void)
+ 	if (!error) {
+ 		error = emmc_ext_csd();
+ 	}
++	if (!error) {
++		emmc_speed_up(speed);
++	}
+ 	if (!error) {
+ 		error = emmc_find_partition(want);
+ 	}
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index b17f6b2..7070977 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -772,10 +772,12 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ //
+ 	if (strcmp(rdBootVar, "emmcroot0") == 0) {
+ 		extern int guamna_emmc_rootdev(dev_t *dev);
++		extern const char *guamna_emmc_diag(void);
+ 		OSSafeReleaseNULL(matching);
+ 		int emmc_error = guamna_emmc_rootdev(root);
+ 		if (emmc_error) {
+-			panic("IOFindBSDRoot: GUAMNA eMMC root %s unavailable: %d", rdBootVar, emmc_error);
++			panic("IOFindBSDRoot: GUAMNA eMMC root %s unavailable: %d [%s]", rdBootVar, emmc_error,
++			    guamna_emmc_diag());
+ 		}
+ 		strlcpy(rootName, rdBootVar, rootNameSize);
+ 		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
