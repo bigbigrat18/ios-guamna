@@ -1,30 +1,49 @@
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index 6c71e7b..197607a 100644
+index 6c71e7b..0b895d1 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
-@@ -20,6 +20,10 @@
+@@ -20,6 +20,9 @@
  
  extern "C" void sweet_secondary_entry(void);
  extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
 +#if defined(GUAMNA)
 +extern "C" void sweet_gic_diag(void);
-+extern "C" void delay(int usec);
 +#endif
  
  class SweetCPU;
  static SweetCPU *sweet_cpus[MAX_CPUS];
-@@ -168,7 +172,18 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -156,6 +159,10 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
++#if defined(GUAMNA)
++		kprintf("SWEET CPU: processor_start(cpu=%u) returned %d\n", i, kr);
++		sweet_gic_diag();
++#endif
+ 		if (kr != KERN_SUCCESS) {
+ 			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
+ 		}
+@@ -168,7 +175,27 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  				    i, topology->cpus[i].phys_id);
  				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
  			}
 +#if defined(GUAMNA)
-+			/* Bring-up: IOSleep needs the timer IRQ under test; busy-wait and report. */
++			/*
++			 * Bring-up: IOSleep needs the timer IRQ under test, and so does
++			 * delay() (it blocks on a timer when interrupts are enabled).
++			 * Spin on the counter and report once a second.
++			 */
 +			static unsigned int spins;
-+			delay(1000);
-+			if (++spins % 1000 == 1) {
++			if (spins++ % 1000 == 0) {
 +				kprintf("SWEET CPU: waiting for cpu=%u: initialized=%u signal_enabled=%u\n", i,
 +				    __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE), sweet_cpu_signal_is_enabled(i));
 +				sweet_gic_diag();
++			}
++			uint64_t until;
++			nanoseconds_to_absolutetime(NSEC_PER_MSEC, &until);
++			until += mach_absolute_time();
++			while (mach_absolute_time() < until) {
++				;
 +			}
 +#else
  			IOSleep(1);
