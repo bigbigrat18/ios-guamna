@@ -111,6 +111,10 @@ jobs:
               print(f"OS_PATCH_LEVEL={(lvl >> 4) + 2000}-{lvl & 0xf:02d}")
           EOF
           echo "DTB=$PWD/private/unpacked/dtb" >> "$GITHUB_ENV"
+          # Motorola's ABL software-reboots ~2 s after "Booting OKAY" when the
+          # header cmdline is just "console=null" (bisected with h1-h3 hybrids,
+          # 2026-11-01). Use the stock image's own header cmdline.
+          echo "BOOT_CMDLINE=$(sed -n 's/^cmdline: //p' private/unpacked/header.txt)" >> "$GITHUB_ENV"
 
       - name: XNU payload (payload=kernel)
         if: inputs.payload == 'kernel'
@@ -142,7 +146,7 @@ jobs:
             #   h1 = LOS kernel + LOS ramdisk + LOS cmdline (our repacking only)
             #   h2 = shim s0   + LOS ramdisk + LOS cmdline
             #   h3 = shim s0   + empty ramdisk + LOS cmdline   (s0 = + "console=null")
-            los_cmdline=$(sed -n 's/^cmdline: //p' private/unpacked/header.txt)
+            los_cmdline="$BOOT_CMDLINE"
             echo "LineageOS header cmdline: $los_cmdline"
             hyb() {
               mkbootimg --header_version 2 --kernel "$1" --ramdisk "$2" --dtb "$DTB" --base 0 \

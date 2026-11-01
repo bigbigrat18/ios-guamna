@@ -40,7 +40,7 @@ mkbootimg --header_version 2 --kernel out/Image --ramdisk out/ramdisk.bin \
 	--ramdisk_offset "${RAMDISK_OFFSET:-0x1000000}" \
 	--tags_offset "${TAGS_OFFSET:-0x100}" --dtb_offset "${DTB_OFFSET:-0x1f00000}" --pagesize "${PAGESIZE:-4096}" \
 	--os_version "${OS_VERSION:-17.0.0}" --os_patch_level "${OS_PATCH_LEVEL:-2035-06}" \
-	--cmdline "console=null" -o out/shim-boot.img
+	--cmdline "${BOOT_CMDLINE:-console=null}" -o out/shim-boot.img
 # Host render of the console layout.
 gcc -O1 -Wall $([ "$BOARD" = guamna ] && echo -DBOARD_GUAMNA) -o out/host_test console.c host_test.c && ./out/host_test
 ls -l out/Image out/shim-boot.img

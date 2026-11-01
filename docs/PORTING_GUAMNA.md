@@ -232,6 +232,13 @@ to a draft release titled `guamna-boot` instead (never commit boot images).
    `mkadt --board guamna`.
 2. Download the `shim-boot-guamna-*` artifact, then `fastboot boot shim-boot-guamna-none.img`.
 
+**Gotcha (found 2026-11-01):** Motorola's ABL accepts the image (`Booting OKAY`
+after its 10 s unlocked-bootloader warning), then **software-reboots about 2 s
+later if the boot image header cmdline is just `console=null`**. Bisected with
+hybrid images: our shim kernel + empty ramdisk + LineageOS's header cmdline
+boots fine. The workflow therefore copies the stock image's header cmdline
+(`androidboot.hardware=qcom … earlycon=msm_geni_serial,0x4a90000 …`).
+
 ## 7. Bring-up order
 
 1. **Live FDT**: `adb root && adb pull /sys/firmware/fdt guamna-live.dtb`, then
