@@ -343,6 +343,11 @@ static void test_gic(void)
 
 	stage = "gic vtimer";
 	irq_window("VTIMER", r, VTIMER_INTID);
+#ifdef BOARD_GUAMNA
+	/* guamna: the kernel saw no timer interrupts; is the physical timer different? */
+	stage = "gic ptimer";
+	irq_window("PTIMER", r, PTIMER_INTID);
+#endif
 	stage = "gic sgi";
 	irq_window("SGI1", r, SGI_INTID);
 	wr32(r + GICR_ICENABLER0, 0xffffffff);
@@ -526,6 +531,9 @@ void shim_main(uint64_t dtb)
 #ifdef BOARD_GUAMNA
 	/* No payload: report what the guamna port assumes (MMU still off). */
 	probe_board();
+	con_skip();
+	/* XNU on guamna never gets a timer interrupt: replay its GIC setup here. */
+	test_gic();
 	con_skip();
 	con_str("PROBE", "done, reset in ~3 min");
 #else
