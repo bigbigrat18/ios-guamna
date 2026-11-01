@@ -281,7 +281,15 @@ boots fine. The workflow therefore copies the stock image's header cmdline
 
 ## 8. Risks to check before investing heavily
 
-1. **iOS 16 userland ISA.** The iPhone X (A11 = ARMv8.2) userland may be built
+1. **iOS 16 userland ISA: checked, OK (2026-11-01).** `tools/isa-scan.py` over
+   the code sections of the 20H392 shared cache finds ~2,500 v8.1+ words (990
+   LSE, 1,435 FP16, a few RDM/dot) in the iPhone X cache, and *exactly the same
+   counts* in the iPad 5 (A9, ARMv8.0) cache of the same build, which runs on a
+   CPU without them: they are runtime-selected paths (libdispatch,
+   libsystem_platform read the commpage capability bits, which XNU builds from
+   ID_AA64ISAR0/PFR0, i.e. no LSE/FP16 on guamna). A first scan of whole r-x
+   mappings was wrong (200k "hits" from __TEXT data). Original concern: the
+   iPhone X (A11 = ARMv8.2) userland may be built
    with LSE atomics or other v8.1+ instructions. If it is, every process hits
    UNDEFINED instructions on A53/A73. This is the potential show-stopper. Check
    first: extract a few core dylibs from the shared cache (`libsystem_kernel`,

@@ -11,6 +11,10 @@
   header cmdline (shim.yml copies it). XNU (0086) boots to its fbcon console
   through pmap/VM bootstrap, then panics in kmem_range_init (claim "zones")
   -> 0087. Photos in chat only.
+- ISA check done: iPhone X 20H392 userland is usable on ARMv8.0 (v8.1+ code
+  only in runtime-dispatched paths; identical counts in the A9 iPad 5 cache).
+  Kernel 0088 + CPU-compatible ADT fix: SweetCPU starts, then no timer IRQs
+  in the kernel although the shim's GIC test gets them -> 0089 diagnostics.
 - Earlier status: patches 0082 (GUAMNA machine config:
   4K pages, `-mcpu=cortex-a53`, no PAN, LL/SC commpage, sweet hardware drivers
   compiled out) and 0083 (`bsd/dev/guamna_emmc.c`, `rd=emmcroot0`);
