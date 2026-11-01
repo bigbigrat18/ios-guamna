@@ -1,8 +1,9 @@
 # Porting ios-sweet to guamna (Moto G Play 2021, SM4250)
 
-Branch `guamna-port`. Reference board: sweet (Redmi Note 10 Pro, SM7150).
-Nothing here has run on a guamna yet. "Done" below means written, and checked
-as far as possible without the phone or a macOS CI run (see *What was checked*).
+Branch `guamna-port` of `bigbigrat18/ios-guamna`. Reference board: sweet
+(Redmi Note 10 Pro, SM7150). **The GUAMNA kernel builds in CI** (run
+41332581911, Xcode 16 on macos-15) and contains only ARMv8.0 instructions.
+Nothing has run on a guamna yet (see *What was checked*).
 
 ## 1. What actually differs
 
@@ -168,15 +169,31 @@ ADT has placeholders `/guamna-rpm-msg-ram` and `/guamna-apcs-ipc` for it.
 
 ## 6. CI
 
+Runner: `macos-15` (Xcode 16) by default. GitHub retired `macos-14` (Xcode 15)
+on 2026-11-02. Patch **0084** backports `IORPC.kernelContent` so that Xcode 16's
+`iig` output compiles against xnu-8796; SWEET builds with it too.
+
+GUAMNA-specific build fixes found by CI:
+- **0085**: a macOS-platform kernel's user VA limit (`0x7FFFFE000000`) does not
+  fit 4K pages (39-bit user VA, commpage at `0xFFFFFC000`): use the iOS
+  `0xFC0000000`.
+- **libfirehose_kernel** is built by `xcodebuild` for `arm64-apple-macos`, so
+  Apple clang's default `apple-m1` CPU put 12 LSE/LDAPR instructions into the
+  kernel. `.github/scripts/guamna-firehose-cpu.py` gives its arm64 slice
+  `-mcpu=cortex-a53` through its xcconfig (the command line cannot take
+  `[arch=arm64]` settings).
+
 `.github/workflows/xnu.yml` now has a matrix:
 - push to `main` (patches or workflow changed): builds SWEET **and** GUAMNA.
   That doubles the macOS minutes.
 - `workflow_dispatch`: `machine_config` = `SWEET` | `GUAMNA` | `ALL`.
 - Artifacts: `xnu-kernel` / `xnu-buildtree` (sweet, unchanged names),
   `xnu-kernel-guamna` / `xnu-buildtree-guamna`.
-- **ARMv8.0 instruction guard** (GUAMNA only): disassembles the kernel with
-  `otool` and fails the job on any LSE, RCpc, STLUR or PAN instruction. These
-  would be UNDEFINED on the phone.
+- **ARMv8.0 instruction guard** (GUAMNA only): `llvm-objdump` of every code
+  section (the kernel's code is in `__TEXT_EXEC`, which `otool -t` skips),
+  decoding v8.1+ encodings. Fails on any LSE, RCpc, STLUR or PAN instruction
+  (UNDEFINED on the phone), and on a suspiciously small disassembly.
+  Current kernel: 2,281,260 instructions, 0 not ARMv8.0.
 
 ```sh
 gh workflow run xnu.yml -R YOU/ios-sweet -f machine_config=GUAMNA
@@ -221,6 +238,10 @@ gh run download RUN_ID -R YOU/ios-sweet -n xnu-kernel-guamna -D xnu/out
 
 ## What was checked
 
+- **CI**: `kernel.development.guamna` compiles and links with all 85 patches
+  (run 41332581911), and passes the ARMv8.0 guard. SWEET also builds on
+  Xcode 16 with 0084 (run 41329535910).
+
 - The whole series (0001-0083) `git apply`s in CI order onto xnu-8796.141.3.
   0031/0041 only apply after the HFS staging script runs, as in CI.
 - `guamna_emmc.c` compiles cleanly (`clang -target arm64-apple-darwin -Wall -Wextra`)
@@ -228,5 +249,5 @@ gh run download RUN_ID -R YOU/ios-sweet -n xnu-kernel-guamna -D xnu/out
 - The shim compiles warning-free for both boards (`clang -target aarch64-linux-gnu`).
 - `fdt-survey.py` runs against a synthetic bengal-shaped DTB.
 - The ISA-guard regex matches v8.1+ mnemonics and not v8.0 `ldaxr`/`stlr`/`ldar`.
-- **Not checked:** a macOS kernel build, `mkadt.py --board guamna` output (not
-  executed here), anything on hardware.
+- **Not checked:** `mkadt.py --board guamna` output (not executed here),
+  QEMU, anything on hardware.

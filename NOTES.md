@@ -2,13 +2,17 @@
 
 ### >>> guamna port (Moto G Play 2021, SM4250), branch `guamna-port`, 2026-11-01 <<<
 - Plan, file inventory and status: `docs/PORTING_GUAMNA.md`.
-- Written, NOT built on macOS or booted: patches 0082 (GUAMNA machine config:
+- Repo: `bigbigrat18/ios-guamna`. CI is on macos-15/Xcode 16 (0084). GUAMNA
+  kernel BUILDS (run 41332581911, artifact `xnu-kernel-guamna`), 0 non-ARMv8.0
+  instructions in 2.28M; 0085 = iOS user VA limit for 4K pages; firehose lib
+  pinned to cortex-a53 via `.github/scripts/guamna-firehose-cpu.py`.
+- Not booted yet: patches 0082 (GUAMNA machine config:
   4K pages, `-mcpu=cortex-a53`, no PAN, LL/SC commpage, sweet hardware drivers
   compiled out) and 0083 (`bsd/dev/guamna_emmc.c`, `rd=emmcroot0`);
   `mkadt.py --board guamna` (STUB addresses); `tools/fdt-survey.py`;
   `BOARD=guamna shim/build.sh`; CI matrix with an ARMv8.0 instruction guard.
-- Next: live FDT → fdt-survey → real addresses; shim probe boot; first
-  `machine_config=GUAMNA` CI run; check the iOS 16 shared cache for LSE.
+- Next: live FDT → fdt-survey → real addresses; shim probe boot; QEMU
+  cortex-a53 boot of the kernel; check the iOS 16 shared cache for LSE.
 
 ## Agent handoff / active work (2026-10-15, latest)
 
