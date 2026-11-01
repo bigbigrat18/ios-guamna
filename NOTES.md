@@ -6,7 +6,12 @@
   kernel BUILDS (run 41332581911, artifact `xnu-kernel-guamna`), 0 non-ARMv8.0
   instructions in 2.28M; 0085 = iOS user VA limit for 4K pages; firehose lib
   pinned to cortex-a53 via `.github/scripts/guamna-firehose-cpu.py`.
-- Not booted yet: patches 0082 (GUAMNA machine config:
+- 2026-11-01 PHONE: shim probe screen OK (tg16=0 atom=0 pan=0, EL1, FB
+  0x5c000000 720x1600 stride 0xb40, PSCI 1.0); Motorola ABL needs the stock
+  header cmdline (shim.yml copies it). XNU (0086) boots to its fbcon console
+  through pmap/VM bootstrap, then panics in kmem_range_init (claim "zones")
+  -> 0087. Photos in chat only.
+- Earlier status: patches 0082 (GUAMNA machine config:
   4K pages, `-mcpu=cortex-a53`, no PAN, LL/SC commpage, sweet hardware drivers
   compiled out) and 0083 (`bsd/dev/guamna_emmc.c`, `rd=emmcroot0`);
   `mkadt.py --board guamna` (STUB addresses); `tools/fdt-survey.py`;

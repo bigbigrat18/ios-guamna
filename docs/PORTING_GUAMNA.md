@@ -199,6 +199,13 @@ GUAMNA-specific build fixes found by CI:
   the 39-bit TTBR1 range of a 4K-page kernel, so the kernel faulted the moment
   it enabled the MMU (first phone boot: stuck on the shim's "XNU jumping"
   screen). GUAMNA uses the iOS layout (kernel at `0xfffffff007004000`).
+- **0087**: with the iOS layout the 128 GB macOS zone-map claim no longer fits
+  (second phone boot: XNU console up, then `kmem_range_init: vm_map_locate_space
+  failing for claim zones`). GUAMNA uses the iOS 24 GB / 8 GB zone sizes.
+- Not a bug: with >1 GB RAM XNU advertises **16 KB VM pages over 4 KB hardware
+  pages** (arm_init.c, `PAGE_RATIO` 4), as Apple did on 4K-page SoCs. The
+  phone's `vm_page_bootstrap: 79158 free pages` is 79158 × 16 KB = 1.24 GB, and
+  iOS userland sees the 16 KB page size it was built for.
 - **libfirehose_kernel** is built by `xcodebuild` for `arm64-apple-macos`, so
   Apple clang's default `apple-m1` CPU put 12 LSE/LDAPR instructions into the
   kernel. `.github/scripts/guamna-firehose-cpu.py` gives its arm64 slice
