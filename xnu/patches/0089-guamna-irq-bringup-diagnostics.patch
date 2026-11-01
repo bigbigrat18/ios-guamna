@@ -1,18 +1,19 @@
 diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
-index 6c71e7b..0b895d1 100644
+index 6c71e7b..257c7bd 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
-@@ -20,6 +20,9 @@
+@@ -20,6 +20,10 @@
  
  extern "C" void sweet_secondary_entry(void);
  extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
 +#if defined(GUAMNA)
 +extern "C" void sweet_gic_diag(void);
++extern "C" void sweet_gic_diag_str(char *buf, unsigned long len);
 +#endif
  
  class SweetCPU;
  static SweetCPU *sweet_cpus[MAX_CPUS];
-@@ -156,6 +159,10 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -156,6 +160,10 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  	for (unsigned int i = 0; i < topology->num_cpus; i++) {
  		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
  		kern_return_t kr = processor_start(cpu->machProcessor);
@@ -23,8 +24,16 @@ index 6c71e7b..0b895d1 100644
  		if (kr != KERN_SUCCESS) {
  			panic("SWEET CPU: cpu=%u processor_start failed: %d", i, kr);
  		}
-@@ -168,7 +175,27 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -166,9 +174,35 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 			if (mach_absolute_time() > deadline) {
+ 				IOLog("SWEET CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
  				    i, topology->cpus[i].phys_id);
++#if defined(GUAMNA)
++				char diag[320];
++				sweet_gic_diag_str(diag, sizeof(diag));
++				panic("SWEET CPU: cpu=%u startup timeout: init=%u sig=%u %s", i,
++				    __atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE), sweet_cpu_signal_is_enabled(i), diag);
++#endif
  				panic("SWEET CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
  			}
 +#if defined(GUAMNA)
@@ -72,14 +81,29 @@ index 24f1abc..4170c1b 100644
  		return; /* spurious */
  	}
 diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
-index 6089db9..59342fe 100644
+index 6089db9..a7cb37e 100644
 --- a/pexpert/arm/pe_fiq.c
 +++ b/pexpert/arm/pe_fiq.c
-@@ -73,6 +73,24 @@ find_gicr_pe_base()
+@@ -73,6 +73,39 @@ find_gicr_pe_base()
  	panic("%s: cannot find GICR base for core %u", __func__, ml_get_cpu_number(phys_id));
  }
  
 +#if defined(GUAMNA)
++/* Bring-up: the same state as one short string, for a panic message. */
++void sweet_gic_diag_str(char *buf, unsigned long len);
++void
++sweet_gic_diag_str(char *buf, unsigned long len)
++{
++	vm_offset_t gicr_pe_base = find_gicr_pe_base();
++	snprintf(buf, len, "ctlr=%x wk=%x grp=%x en=%x pend=%x act=%x pri=%x daif=%llx isr=%llx hppi=%llx pmr=%llx g1=%llx sre=%llx cctl=%llx tctl=%llx",
++	    gicd_read32(GICD_CTLR), gicr_read32(GICR_WAKER), gicr_read32(GICR_IGROUPR0),
++	    gicr_read32(GICR_ISENABLER0), gicr_read32(GICR_ISENABLER0 + 0x100), gicr_read32(GICR_ISENABLER0 + 0x200),
++	    gicr_read32(GICR_IPRIORITYR0 + 16),
++	    __builtin_arm_rsr64("DAIF"), __builtin_arm_rsr64("ISR_EL1"), __builtin_arm_rsr64("ICC_HPPIR1_EL1"),
++	    __builtin_arm_rsr64("ICC_PMR_EL1"), __builtin_arm_rsr64("ICC_IGRPEN1_EL1"), __builtin_arm_rsr64("ICC_SRE_EL1"),
++	    __builtin_arm_rsr64("ICC_CTLR_EL1"), __builtin_arm_rsr64("CNTV_CTL_EL0"));
++}
++
 +/* Bring-up: everything that decides whether the virtual timer IRQ reaches us. */
 +void sweet_gic_diag(void);
 +void
