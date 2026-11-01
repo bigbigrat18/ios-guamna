@@ -19,6 +19,12 @@ on:
       size:
         description: HFS+ image size (must fit guamna's userdata)
         default: 16G
+      device:
+        description: Device whose 20H392 IPSW to use (iPhone10,3 = iPhone X, A11/ARMv8.2; iPad6,11 = iPad 5, A9/ARMv8.0)
+        default: iPhone10,3
+      board:
+        description: BuildManifest DeviceClass (d22ap for iPhone10,3, j71sap for iPad6,11)
+        default: d22ap
 
 permissions:
   contents: read
@@ -28,8 +34,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     env:
-      IPSW_URL: https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw
-      IPSW_SHA256: ece1194f7e233e9109c5790a8d23a4564a10a254e15ec5b09978a343265568fb
+      DEVICE: ${{ inputs.device || 'iPhone10,3' }}
+      BOARD: ${{ inputs.board || 'd22ap' }}
+      BUILD: 20H392
       IPSW_TOOL: v3.1.720
       APFS_FUSE_SHA: 66b86bd525e8cb90f9012543be89b1f092b75cf3
       W: /mnt/work
@@ -62,24 +69,29 @@ jobs:
           apfs-fuse 2>&1 | head -2 || true
           ipsw version
 
-      - name: Download IPSW (6.2 GB, SHA-256 checked)
+      - name: Download IPSW (SHA-256 from ipsw.me checked)
         run: |
-          curl -fL --retry 3 --retry-delay 10 -o "$W/fw.ipsw" "$IPSW_URL"
-          echo "$IPSW_SHA256  $W/fw.ipsw" | sha256sum -c -
+          curl -fsS "https://api.ipsw.me/v4/ipsw/$DEVICE/$BUILD" > "$W/ipsw.json"
+          url=$(python3 -c "import json;print(json.load(open('$W/ipsw.json'))['url'])")
+          sha=$(python3 -c "import json;print(json.load(open('$W/ipsw.json'))['sha256sum'])")
+          echo "$DEVICE $BUILD: $url"
+          curl -fL --retry 3 --retry-delay 10 -o "$W/fw.ipsw" "$url"
+          echo "$sha  $W/fw.ipsw" | sha256sum -c -
 
       - name: Extract OS, cryptexes and the D22AP device tree
         run: |
           unzip -p "$W/fw.ipsw" BuildManifest.plist > "$W/BuildManifest.plist"
-          python3 - "$W/BuildManifest.plist" > "$W/members.env" <<'EOF'
+          python3 - "$W/BuildManifest.plist" "$BOARD" > "$W/members.env" <<'EOF'
           import plistlib, sys
           bm = plistlib.load(open(sys.argv[1], 'rb'))
-          ids = [i for i in bm['BuildIdentities'] if i['Info'].get('DeviceClass', '').lower() == 'd22ap']
+          ids = [i for i in bm['BuildIdentities'] if i['Info'].get('DeviceClass', '').lower() == sys.argv[2].lower()]
           ident = next((i for i in ids if 'Erase' in i['Info'].get('RestoreBehavior', '')), ids[0])
           m = ident['Manifest']
           print(f"OS={m['OS']['Info']['Path']}")
           print(f"SYSOS={m['Cryptex1,SystemOS']['Info']['Path']}")
           print(f"APPOS={m['Cryptex1,AppOS']['Info']['Path']}")
           print(f"DT={m['DeviceTree']['Info']['Path']}")
+          print(f"IDENTITY={ident['Info'].get('DeviceClass')}/{ident['Info'].get('RestoreBehavior')}", file=sys.stderr)
           EOF
           cat "$W/members.env"
           . "$W/members.env"
@@ -111,13 +123,13 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: lse-report
+          name: lse-report-${{ inputs.device || 'iPhone10,3' }}
           path: lse-report/
           retention-days: 30
 
       - uses: actions/upload-artifact@v4
         with:
-          name: d22ap-adt
+          name: ${{ inputs.board || 'd22ap' }}-adt
           path: /mnt/work/d22ap.adt
           retention-days: 3
 
@@ -142,7 +154,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: inputs.build_root
         with:
-          name: ios16-root-simg
+          name: ios16-root-simg-${{ inputs.device || 'iPhone10,3' }}
           path: /mnt/work/ios16-root.simg
           retention-days: 3
           compression-level: 1
