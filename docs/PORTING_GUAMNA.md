@@ -195,6 +195,10 @@ GUAMNA-specific build fixes found by CI:
 - **0085**: a macOS-platform kernel's user VA limit (`0x7FFFFE000000`) does not
   fit 4K pages (39-bit user VA, commpage at `0xFFFFFC000`): use the iOS
   `0xFC0000000`.
+- **0086**: the macOS large-memory kernel layout (kernel at -2TB) is outside
+  the 39-bit TTBR1 range of a 4K-page kernel, so the kernel faulted the moment
+  it enabled the MMU (first phone boot: stuck on the shim's "XNU jumping"
+  screen). GUAMNA uses the iOS layout (kernel at `0xfffffff007004000`).
 - **libfirehose_kernel** is built by `xcodebuild` for `arm64-apple-macos`, so
   Apple clang's default `apple-m1` CPU put 12 LSE/LDAPR instructions into the
   kernel. `.github/scripts/guamna-firehose-cpu.py` gives its arm64 slice
