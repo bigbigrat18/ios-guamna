@@ -46,7 +46,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq hfsprogs rsync fuse3 libfuse3-dev libbz2-dev zlib1g-dev libattr1-dev \
-            cmake g++ android-sdk-libsparse-utils unzip
+            cmake g++ android-sdk-libsparse-utils unzip python3-numpy
           sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)" || true
           sudo modprobe hfsplus
           git clone -q https://github.com/sgan81/apfs-fuse "$W/apfs-fuse"
@@ -104,52 +104,9 @@ jobs:
           sudo cp "$dsc"* "$W/" 2>/dev/null; sudo chown "$USER" "$W"/dyld_shared_cache_arm64*
           sudo cp "$W/os-mnt/root/usr/lib/dyld" "$W/dyld" && sudo chown "$USER" "$W/dyld"
           sudo umount "$W/sysos-mnt" "$W/os-mnt"
-          python3 - "$W" <<'EOF' | tee lse-report/report.md >> "$GITHUB_STEP_SUMMARY"
-          import re, subprocess, sys
-          w = sys.argv[1]
-          dsc = f'{w}/dyld_shared_cache_arm64'
-          cats = {
-            'LSE atomics (v8.1)': r'\b(cas(p)?(a|al|l)?[bh]?|ld(add|clr|eor|set|smax|smin|umax|umin)(a|al|l)?[bh]?|st(add|clr|eor|set|smax|smin|umax|umin)l?[bh]?|swp(a|al|l)?[bh]?)\b',
-            'RDM (v8.1)': r'\bsqrdml[as]h\b',
-            'RCpc LDAPR (v8.3)': r'\bldap(u)?r[bh]?\b',
-            'FP16 arithmetic (v8.2)': r'\bf(add|sub|mul|div|madd|msub|nmul|abs|neg|sqrt|max|min|maxnm|minnm|cmp|cmpe|ccmp|csel|cvtzs|cvtzu|rint[a-z]?)\s+h\d|\.[48]h\b.*\bf[a-z]+\b|\bf[a-z]+\b.*\.[48]h\b',
-            'Dot product (v8.2+)': r'\b[su]dot\b',
-            'FJCVTZS (v8.3)': r'\bfjcvtzs\b',
-          }
-          ansi = re.compile(r'\x1b\[[0-9;]*m')
-          images = ['libsystem_kernel.dylib', 'libsystem_platform.dylib', 'libsystem_pthread.dylib',
-                    'libsystem_malloc.dylib', 'libsystem_c.dylib', 'libdispatch.dylib', 'libobjc.A.dylib',
-                    'libc++.1.dylib', 'libc++abi.dylib', 'CoreFoundation', 'Foundation', 'libxpc.dylib',
-                    'QuartzCore', 'BackBoardServices', 'FrontBoardServices', 'SpringBoardFoundation']
-          def scan(cmd):
-              p = subprocess.run(cmd, capture_output=True, text=True)
-              out = ansi.sub('', p.stdout)
-              lines = [l for l in out.splitlines() if re.match(r'\s*0x[0-9a-f]+', l, re.I)]
-              res = {}
-              for c, rx in cats.items():
-                  r = re.compile(rx, re.I)
-                  hits = [l.strip() for l in lines if r.search(l.split(':', 1)[-1] if ':' in l else l)]
-                  res[c] = hits
-              return len(lines), res, p.returncode, p.stderr[-300:]
-          print('# iOS 16.7.16 (iPhone10,3) userland vs ARMv8.0 (guamna)\n')
-          print('| image | instructions | ' + ' | '.join(cats) + ' |')
-          print('|---|---|' + '---|' * len(cats))
-          examples = []
-          targets = [('/usr/lib/dyld', ['ipsw', 'macho', 'disass', f'{w}/dyld', '--all'])]
-          targets += [(img, ['ipsw', 'dyld', 'disass', dsc, '--image', img]) for img in images]
-          for name, cmd in targets:
-              n, res, rc, err = scan(cmd)
-              if n == 0:
-                  print(f'| {name} | **disassembly failed** (rc {rc}: {err.strip()[:120]}) |' + ' |' * len(cats))
-                  continue
-              print(f'| {name} | {n} | ' + ' | '.join(str(len(h)) for h in res.values()) + ' |')
-              for c, h in res.items():
-                  examples += [(name, c, x) for x in h[:3]]
-          print('\n## First examples\n```')
-          for name, c, x in examples[:60]:
-              print(f'{name:28} {c:24} {x[:110]}')
-          print('```')
-          EOF
+          # tools/isa-scan.py matches A64 encodings directly (ipsw v3.1.720's
+          # `dyld disass` crashed with a Go panic on this cache).
+          python3 tools/isa-scan.py "$W/dyld_shared_cache_arm64" --top 25 | tee lse-report/report.md >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         if: always()
