@@ -173,9 +173,9 @@ BLOCKS = [
     ('dwc3', 'USB DWC3'), ('qusb2', 'USB QUSB2 PHY'), ('usb-hs-phy', 'USB HS PHY'),
     ('mdss', 'Display MDSS'), ('mdp', 'Display MDP'), ('dsi', 'DSI'),
     ('simple-framebuffer', 'simple-framebuffer'), ('gpio-keys', 'gpio-keys'),
-    ('pon', 'PMIC PON'), ('smem', 'SMEM'), ('watchdog', 'watchdog'), ('wdt', 'watchdog'),
+    ('-pon', 'PMIC PON'), ('pwrkey', 'PMIC PON'), ('smem', 'SMEM'), ('watchdog', 'watchdog'), ('wdt', 'watchdog'),
 ]
-TOUCH_HINTS = ('touch', 'ts@', 'goodix', 'focaltech', 'novatek', 'ilitek', 'himax', 'synaptics',
+TOUCH_HINTS = ('touch', '_ts@', 'goodix', 'focaltech', 'novatek', 'ilitek', 'himax', 'synaptics',
                'chipone', 'fts', 'nvt', 'hx83')
 
 
@@ -260,7 +260,7 @@ def main():
     for c in (cpus.children if cpus else []):
         if c.str('device_type') == 'cpu':
             print('  %-8s mpidr=0x%03x %-24s enable-method=%s capacity=%s' % (
-                c.name, c.u32('reg', 0), c.str('compatible'), c.str('enable-method'),
+                c.name, join(c.cells('reg')), c.str('compatible'), c.str('enable-method'),
                 c.u32('capacity-dmips-mhz')))
     for n in root.walk():
         compat = ' '.join(n.strs('compatible'))
@@ -283,6 +283,8 @@ def main():
     for n in root.walk():
         compat = ' '.join(n.strs('compatible'))
         label = next((l for k, l in BLOCKS if k in compat), None)
+        if any(h in compat for h in ('tddi', 'ilitek', 'focaltech', 'himax', 'goodix', 'novatek', 'synaptics')):
+            label = None
         low = (n.name + ' ' + compat).lower()
         if label is None and any(h in low for h in TOUCH_HINTS) and 'reg' in n.props:
             label = 'touch?'
@@ -303,9 +305,10 @@ def main():
 
     # ---- mkadt snippet ----
     def first(label, name=None):
+        # reg-names vary: mainline 'hc'/'cqhci', downstream 'hc_mem'/'cqhci_mem'
         for n in found.get(label, []):
             for a, s, rn in regs(n):
-                if a is not None and (name is None or rn == name):
+                if a is not None and (name is None or rn in (name, name + '_mem')):
                     return '(0x%08x, 0x%x)' % (a, s)
         return 'None'
 

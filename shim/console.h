@@ -2,8 +2,8 @@
 #include <stdint.h>
 
 #ifdef BOARD_GUAMNA
-/* Moto G Play 2021: 720x1600. TODO verify base/stride with tools/fdt-survey.py */
-#define FB_BASE		0x5c000000UL	/* reserved-memory cont_splash_region (UNVERIFIED) */
+/* Moto G Play 2021: 720x1600. Base from the live FDT; stride still unconfirmed */
+#define FB_BASE		0x5c000000UL	/* reserved-memory cont_splash_region */
 #define FB_W		720
 #define FB_H		1600
 #define FB_STRIDE	(FB_W * 4)

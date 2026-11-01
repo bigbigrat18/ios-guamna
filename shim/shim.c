@@ -13,8 +13,10 @@
 #include "ufs.h"
 
 #ifdef BOARD_GUAMNA
-/* SM4250: GIC from mainline sm6115.dtsi (UNVERIFIED). IMEM restart reason and
- * PS_HOLD are unknown: reset() uses PSCI SYSTEM_RESET only. */
+/* SM4250 (guamna live FDT) */
+#define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem@c125000 restart_reason@65c */
+#define RESTART_BOOTLOADER	0x77665500U
+#define PSHOLD			0x0440b000UL	/* qcom,pshold restart@440b000 */
 #define GICD_BASE		0x0f200000UL
 #define GICR_BASE		0x0f300000UL
 #else
@@ -113,14 +115,10 @@ static void __attribute__((noreturn)) reset(unsigned after_s)
 	con_skip();
 	con_str("RESET", after_s > 20 ? "in 40s" : "in 20s");
 	delay_ms(after_s * 1000);
-#ifndef BOARD_GUAMNA
 	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
-#endif
 	__asm__ volatile("dsb sy" ::: "memory");
 	smc(PSCI_SYSTEM_RESET, 0, 0, 0);
-#ifndef BOARD_GUAMNA
 	wr32(PSHOLD, 0);
-#endif
 	for (;;)
 		__asm__ volatile("wfe");
 }

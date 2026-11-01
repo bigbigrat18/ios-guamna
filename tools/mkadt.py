@@ -6,7 +6,7 @@ address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu
 
 --board guamna builds the Moto G Play 2021 (SM4250) tree instead; see
 build_guamna() and docs/PORTING_GUAMNA.md. Its addresses are a STUB until
-tools/fdt-survey.py has been run on guamna's live FDT.
+the TODO values are filled in (most come from guamna's live FDT now).
 """
 import hashlib, os, struct, sys
 
@@ -248,60 +248,53 @@ def build(seed=None, qemu=False, highmem=False):
 # --------------------------------------------------------------------------
 # guamna: Motorola Moto G Play 2021, Qualcomm SM4250 (Snapdragon 460, "bengal")
 #
-# STUB. Status of every value:
-#   USER      given by the porter (UART, GCC)
-#   MAINLINE  from Linux arch/arm64/boot/dts/qcom/sm6115.dtsi (SM4250 is the
-#             same die), recalled, NOT read from this phone
+# Status of every value:
+#   LIVE      read from guamna's live FDT with tools/fdt-survey.py
+#   USER      given by the porter
 #   TODO      unknown; None means "not emitted" and is reported on stderr
-# Replace MAINLINE/TODO values with the output of
-#   tools/fdt-survey.py guamna-live.dtb
-# (live FDT: `adb root && adb pull /sys/firmware/fdt guamna-live.dtb`).
+# Live FDT with Magisk: adb shell "su -c 'cat /sys/firmware/fdt > /sdcard/x.dtb'".
 # A wrong MMIO address does not brick anything (XNU runs from RAM via
 # `fastboot boot`), but an XPU-protected one hangs the phone until a
 # forced reboot (hold Power + Volume down).
 # --------------------------------------------------------------------------
 GUAMNA = dict(
-    # RAM handed to XNU: one contiguous range that avoids every FIXED
-    # reserved-memory carve-out (TZ, hyp, XBL/AOP, SMEM, PIL regions). bengal
-    # DDR starts at 0x40000000 and all 3 GiB sit below 4 GiB, so unlike sweet
-    # there is no carve-out-free upper bank. TODO: take the largest free range
-    # that fdt-survey.py reports. This placeholder (2 GiB at 0x60000000)
-    # assumes the PIL/splash carve-outs end below 0x60000000.
-    phys_base=0x60000000,                      # TODO
-    mem_size=0x80000000,                       # TODO
-    soc_base=0x00400000,                       # /arm-io base; below TLMM, must be != 0
-    gicd=(0x0f200000, 0x10000),                # MAINLINE intc reg[0]
-    gicr=(0x0f300000, 0x100000),               # MAINLINE intc reg[1], stride 0x20000
-    timebase=19200000,                         # MAINLINE
-    vtimer_intid=19,                           # MAINLINE <GIC_PPI 3 ...> = 16 + 3, same as sweet
-    # ABL continuous-splash framebuffer (reserved-memory cont_splash_region).
-    fb=(0x5c000000, 0x00f00000),               # TODO (MAINLINE-ish guess)
-    fb_w=720, fb_h=1600, fb_stride=720 * 4,    # panel is 720x1600; stride TODO (check ABL pads)
-    # Storage: eMMC 5.1 on SDHC1 (sdhci-msm v5). reg = hc, cqhci.
-    emmc=(0x04744000, 0x1000),                 # MAINLINE sdhc_1 "hc"
-    emmc_cqhci=(0x04745000, 0x1000),           # MAINLINE sdhc_1 "cqhci"
-    uart=(0x04a90000, 0x4000),                 # USER: QUPv3 SE4 GENI UART (debug UART)
-    gcc=(0x01400000, 0x1f0000),                # USER
-    # TLMM: mainline sm6115 has three tiles at 0x00500000 (west),
-    # 0x00900000 (south), 0x00d00000 (east). The 0x03000000 in the porting
-    # brief does not match that; fdt-survey.py settles it.
-    tlmm=(0x00500000, 0x00c00000),             # MAINLINE, conflicts with brief (0x03000000)
-    # SPMI PMIC arbiter v5 (PM6125 + PMI632): core, obsrvr, cnfg.
-    spmi_core=(0x01c40000, 0x1100),            # MAINLINE
-    spmi_obsrvr=(0x03e00000, 0x100000),        # MAINLINE
-    spmi_cnfg=(0x01c0a000, 0x26000),           # MAINLINE
-    # RPM (not RPMh): GLINK over the RPM message RAM, kicked through the
-    # APCS IPC register. Needed for regulator votes; nothing uses it yet.
-    rpm_msg_ram=None,                          # TODO (0x045f0000 in mainline?)
-    apcs_ipc=None,                             # TODO (APCS glb + 0x8, bit 0?)
-    # USB (DWC3 + QUSB2), for the ECM log/network gadget later.
-    usb_dwc3=None,                             # TODO (0x04e00000 in mainline?)
-    usb_qscratch=None,                         # TODO (0x04ef8800?)
-    usb_qusb2=None,                            # TODO (0x01613000?)
-    # Kryo 240: cluster 0 = 4x Cortex-A53 (MPIDR 0x000-0x003), cluster 1 =
-    # 4x Cortex-A73 (MPIDR 0x100-0x103). Classic big.LITTLE: Aff1 is the
-    # cluster, Aff0 the core (sweet's DynamIQ puts the core in Aff1).
-    cpus=[(0, c, 1804800000) for c in range(4)] + [(1, c, 1804800000) for c in range(4)],  # TODO freqs
+    # Values marked LIVE come from guamna's live FDT (tools/fdt-survey.py,
+    # LineageOS, 2026-11-01). DRAM banks: 0x40000000-0x7e580000,
+    # 0x80000000-0x100000000. Fixed carve-outs end with Motorola's no-map
+    # mmi_annotate/tzlog/wdog_cpuctx/ramoops at 0xaef9d800-0xaf0bf800, so the
+    # largest contiguous free range starts at 0xb0000000 (32 MiB aligned).
+    # 1.25 GiB: iOS will be tight (jetsam); see docs/PORTING_GUAMNA.md.
+    phys_base=0xb0000000,                      # LIVE
+    mem_size=0x50000000,                       # LIVE (up to 0x100000000)
+    soc_base=0x00400000,                       # /arm-io base; = TLMM base, must be != 0
+    gicd=(0x0f200000, 0x10000),                # LIVE
+    gicr=(0x0f300000, 0x100000),               # LIVE, redistributor-stride 0x20000
+    timebase=19200000,                         # LIVE
+    vtimer_intid=19,                           # LIVE timer PPIs [1, 2, 3, 0] -> 16 + 3
+    # ABL continuous splash (reserved-memory cont_splash_region, mapped, not no-map).
+    fb=(0x5c000000, 0x00f00000),               # LIVE
+    fb_w=720, fb_h=1600, fb_stride=720 * 4,    # panel 720x1600; stride: confirm with the shim probe
+    # eMMC on SDHC1 (qcom,sdhci-msm-v5 + qcom,sdhci-msm-cqe). sdhc_2 @ 0x04784000 is the SD slot.
+    emmc=(0x04744000, 0x1000),                 # LIVE hc_mem
+    emmc_cqhci=(0x04745000, 0x1000),           # LIVE cqhci_mem (ICE: 0x04748000+0x8000)
+    # GENI SE4 UART: given in the porting brief, but no enabled UART node in
+    # the live FDT (console=null). Kept for a future serial console.
+    uart=(0x04a90000, 0x4000),                 # USER, not in live FDT
+    gcc=(0x01400000, 0x1f0000),                # LIVE
+    tlmm=(0x00400000, 0x00c00000),             # LIVE (not 0x03000000, not mainline 0x00500000)
+    spmi_core=(0x01c40000, 0x1100),            # LIVE
+    spmi_obsrvr=(0x03e00000, 0x100000),        # LIVE
+    spmi_cnfg=(0x01c0a000, 0x26000),           # LIVE
+    # RPM (not RPMh): qcom,glink-rpm + qcom,rpm-smd. Message RAM inferred from
+    # rpm-master-stats @ 0x045f0150 and the MPM vMPM @ 0x045f01b8.
+    rpm_msg_ram=(0x045f0000, 0x7000),          # LIVE-ish (size from mainline)
+    apcs_ipc=(0x0f111000, 0x1000),             # LIVE qcom,bengal-apcs-hmss-global (IPC at +0x8)
+    usb_dwc3=(0x04e00000, 0xcd00),             # LIVE /soc/ssusb@4e00000/dwc3@4e00000
+    usb_qscratch=None,                         # TODO: ssusb wrapper qscratch (0x04ef8800?)
+    usb_qusb2=(0x01613000, 0x180),             # LIVE
+    # Kryo 240: cluster 0 = 4x A53 (cpu@0-3, capacity 1024), cluster 1 =
+    # 4x A73 (cpu@100-103, capacity 1638). MPIDR Aff1 = cluster.
+    cpus=[(0, c, 1804800000) for c in range(4)] + [(1, c, 1804800000) for c in range(4)],  # freqs descriptive
 )
 
 
@@ -312,7 +305,6 @@ def build_guamna(seed=None):
     missing = sorted(k for k, v in g.items() if v is None)
     if missing:
         print('guamna: not emitted (TODO): ' + ', '.join(missing), file=sys.stderr)
-    print('guamna: STUB addresses; verify with tools/fdt-survey.py before booting', file=sys.stderr)
 
     phys_base, mem_size = g['phys_base'], g['mem_size']
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE

@@ -12,14 +12,32 @@ Nothing has run on a guamna yet (see *What was checked*).
 | CPU | 6x A55 + 2x A76, DynamIQ, ARMv8.2 | 4x A53 + 4x A73, big.LITTLE, **ARMv8.0** | No LSE atomics, PAN, RCpc, UAO. Compiler must target A53 |
 | Page granule | 16K | **4K only** (A53 has no 16K granule: `ID_AA64MMFR0_EL1.TGran16 = 0`) | 4K-page XNU, like BCM2837 (RPi 3, also A53) |
 | MPIDR | Aff1 = core (0x000-0x700) | Aff1 = cluster, Aff0 = core (0x000-0x003, 0x100-0x103) | SMP topology checks |
-| GIC | GICv3 @ 0x17a00000 | GICv3 @ 0x0f200000 / GICR 0x0f300000 (mainline, verify) | Address only, same IRQ path |
-| Timer | virt PPI 3 → INTID 19 | same in mainline (verify) | none expected |
-| RAM | 6 GB, XNU uses the empty upper bank above 4G | 3 GB, all below 4G, carve-outs scattered | Pick the largest free range from the live FDT |
+| GIC | GICv3 @ 0x17a00000 | GICv3 @ 0x0f200000 / GICR 0x0f300000 (live FDT) | Address only, same IRQ path |
+| Timer | virt PPI 3 → INTID 19 | same (live FDT) | none |
+| RAM | 6 GB, XNU uses the empty upper bank above 4G | 3 GB in two banks below 4G, carve-outs scattered | XNU gets 1.25 GB @ 0xb0000000 (largest contiguous free range) |
 | Storage | UFS 2.1 | **eMMC 5.1 on SDHC1 (sdhci-msm v5)** | New driver (patch 0083) |
 | Power | RPMh (TCS writes) | **RPM over GLINK** (SMD-RPM messages) | New, harder code, but not needed for first boots |
 | PMIC | PM6150 + PM6150L | PM6125 + PMI632 | Keys/battery addresses |
 | Display | 1080x2400 @ 0x9c000000 | 720x1600, splash address TBD | Framebuffer geometry, iPhone X canvas scaling |
-| Debug UART | none (wired as SPI) | GENI SE4 @ 0x04a90000 | Possible serial console later |
+| Debug UART | none (wired as SPI) | GENI SE4 @ 0x04a90000 per brief, but not enabled in the live FDT | Possible serial console later |
+| Touch | Goodix GT9896, I²C | **SPI** on `spi@4a88000`; FDT lists Focaltech, Ilitek, Himax and Chipone (panel-dependent) | New driver; find the populated chip first |
+| Volume up | PM6150L GPIO2 | PMIC GPIO 5 (`gpio-keys`) | new key mapping |
+
+### Live FDT facts (LineageOS, 2026-11-01)
+
+- DRAM banks `0x40000000-0x7e580000` and `0x80000000-0x100000000`.
+  Last fixed carve-outs are Motorola's `mmi_annotate`/`tzlog`/`wdog_cpuctx`/`ramoops`
+  (`0xaef9d800-0xaf0bf800`, no-map) → XNU RAM `0xb0000000` + `0x50000000`.
+  More RAM later needs XNU to accept a hole (or proof that those Motorola
+  regions are not XPU-protected).
+- ABL put LineageOS's ramdisk at `0x45596000`, just below `hyp_region`
+  (`0x45700000`). Our payload ramdisk is ~20 MB+: check where ABL places it
+  (the shim prints `INITRD lo/hi`) before trusting it not to hit a carve-out.
+- IMEM restart reason `0x0c12565c`, PS_HOLD `0x0440b000` (shim reset path uses both now).
+- TLMM `0x00400000` (+`0xc00000`), GCC `0x01400000`, SPMI core/obsrvr/cnfg
+  `0x01c40000`/`0x03e00000`/`0x01c0a000`, APCS `0x0f111000`, USB DWC3 `0x04e00000`,
+  QUSB2 `0x01613000`, splash FB `0x5c000000`.
+- The tree also has a UFS host (`ufshc@4804000`); guamna boots from eMMC, so ignore it.
 
 ## 2. Inventory: every SM7150 / sweet hardware reference
 
