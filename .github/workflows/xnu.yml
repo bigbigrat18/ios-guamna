@@ -65,6 +65,13 @@ jobs:
           # libfirehose_kernel is built arm64e-only; the SWEET/GUAMNA kernels are plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          if [ "$MACHINE_CONFIG" = GUAMNA ]; then
+            # xcodebuild compiles libfirehose_kernel for arm64-apple-macos, i.e.
+            # Apple clang's apple-m1 default CPU: LSE atomics and LDAPR, which
+            # are UNDEFINED on guamna's A53/A73. Pin its arm64 slice like the kernel.
+            sed -i '' 's/VALID_ARCHS="x86_64 arm64e arm64"/VALID_ARCHS="x86_64 arm64e arm64" "OTHER_CFLAGS[arch=arm64]=\\$(inherited) -mcpu=cortex-a53"/' dxb/build.sh
+            grep -c 'OTHER_CFLAGS\[arch=arm64\]=\\$(inherited) -mcpu=cortex-a53' dxb/build.sh
+          fi
           ls dxb/patches
 
       - name: Deps
@@ -136,19 +143,26 @@ jobs:
       - name: ARMv8.0 instruction guard (GUAMNA)
         if: matrix.machine == 'GUAMNA'
         run: |
+          # Disassemble EVERY code section (the kernel's code is in __TEXT_EXEC,
+          # which `otool -t` does not read) with a decoder that knows v8.1+.
           shopt -s nullglob
           kernels=(out/kernel.*.guamna)
           [ ${#kernels[@]} -gt 0 ] || { echo "no guamna kernel built"; exit 1; }
-          bad='[[:space:]](cas(p)?(a|al|l)?[bh]?|ld(add|clr|eor|set|smax|smin|umax|umin)(a|al|l)?[bh]?|st(add|clr|eor|set|smax|smin|umax|umin)l?[bh]?|swp(a|al|l)?[bh]?|ldapr[bh]?|ldapur[a-z]*|stlur[bh]?)[[:space:]]|msr[[:space:]]+pan'
+          bad='[[:space:]](cas(p)?(a|al|l)?[bh]?|ld(add|clr|eor|set|smax|smin|umax|umin)(a|al|l)?[bh]?|st(add|clr|eor|set|smax|smin|umax|umin)l?[bh]?|swp(a|al|l)?[bh]?|ldapr[bh]?|ldapur[a-z]*|stlur[bh]?)[[:space:]]|msr[[:space:]]+[Pp][Aa][Nn]'
+          # Constant tables that live in code sections and decode as junk.
+          data_syms='^<(K256|_K256|K512|_K512)>:$'
           status=0
           for k in "${kernels[@]}"; do
-            xcrun otool -tvV "$k" > "$k.dis"
-            n=$(grep -Eic "$bad" "$k.dis" || true)
-            echo "$k: $(wc -l < "$k.dis") instructions, $n not ARMv8.0, $(grep -c 'ldaxr' "$k.dis" || true) ldaxr"
-            if [ "$n" != 0 ]; then
-              grep -Ei -B2 "$bad" "$k.dis" | head -60
-              status=1
-            fi
+            xcrun llvm-objdump -d --no-show-raw-insn \
+              --mattr=+v8.5a,+lse,+rcpc,+rcpc-immo,+pan,+rdm,+fullfp16,+dotprod "$k" > "$k.dis"
+            total=$(grep -c '^ *[0-9a-f]*:' "$k.dis" || true)
+            hits=$(awk -v re="$bad" -v data="$data_syms" '
+              /^[0-9a-f]+ <.*>:$/ {fn=$2; skip=(fn ~ data)}
+              !skip && $0 ~ re {print fn, $0}' "$k.dis")
+            n=$(printf '%s' "$hits" | grep -c . || true)
+            echo "$k: $total instructions, $n not ARMv8.0, $(grep -c ldaxr "$k.dis" || true) ldaxr"
+            if [ "$total" -lt 100000 ]; then echo "disassembly too small: guard is not looking at the kernel"; status=1; fi
+            if [ "$n" != 0 ]; then printf '%s\n' "$hits" | head -60; status=1; fi
             rm -f "$k.dis"
           done
           exit $status
