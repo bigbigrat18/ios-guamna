@@ -22,6 +22,13 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      boot_image:
+        description: GUAMNA only - also build the shim boot image (shim.yml, payload=kernel) from this kernel
+        type: boolean
+        default: true
+      boot_cmdline:
+        description: XNU boot-args for that boot image
+        default: "debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=emmcroot0"
   push:
     branches: [main]
     paths:
@@ -44,8 +51,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # push: both boards; workflow_dispatch: the chosen one (or ALL)
-        machine: ${{ fromJSON((github.event_name == 'workflow_dispatch' && inputs.machine_config != 'ALL') && format('["{0}"]', inputs.machine_config) || '["SWEET","GUAMNA"]') }}
+        # push: GUAMNA only (one macOS runner to queue for, not two);
+        # workflow_dispatch: the chosen one, or ALL
+        machine: ${{ fromJSON(github.event_name != 'workflow_dispatch' && '["GUAMNA"]' || (inputs.machine_config == 'ALL' && '["SWEET","GUAMNA"]' || format('["{0}"]', inputs.machine_config))) }}
     env:
       MACHINE_CONFIG: ${{ matrix.machine }}
     # macos-14 shipped Xcode 15 (iig matched xnu-8796); it retired 2026-11-02.
@@ -172,3 +180,19 @@ jobs:
           name: ${{ matrix.machine == 'SWEET' && 'xnu-kernel' || 'xnu-kernel-guamna' }}
           path: out/
           if-no-files-found: warn
+
+  # Boot image from this run's kernel, in the same run: no second dispatch,
+  # and only a quick Ubuntu job after the macOS build.
+  boot:
+    needs: build
+    if: >-
+      success() && (github.event_name != 'workflow_dispatch' ||
+      (inputs.boot_image && (inputs.machine_config == 'GUAMNA' || inputs.machine_config == 'ALL')))
+    permissions:
+      contents: write
+      actions: read
+    uses: ./.github/workflows/shim.yml
+    with:
+      payload: kernel
+      cmdline: ${{ inputs.boot_cmdline || 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress rd=emmcroot0' }}
+      same_run: true

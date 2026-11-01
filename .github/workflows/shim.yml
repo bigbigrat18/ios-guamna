@@ -32,6 +32,24 @@ on:
       release:
         description: Name of the draft release holding boot.img (boot_source=draft)
         default: guamna-boot
+  # Called by xnu.yml right after its GUAMNA build (same_run: kernel artifact of that run)
+  workflow_call:
+    inputs:
+      payload:
+        type: string
+        default: kernel
+      cmdline:
+        type: string
+        default: "debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress"
+      boot_source:
+        type: string
+        default: lineage
+      release:
+        type: string
+        default: guamna-boot
+      same_run:
+        type: boolean
+        default: false
 
 permissions:
   contents: write   # needed to see draft releases
@@ -116,11 +134,19 @@ jobs:
           # 2026-11-01). Use the stock image's own header cmdline.
           echo "BOOT_CMDLINE=$(sed -n 's/^cmdline: //p' private/unpacked/header.txt)" >> "$GITHUB_ENV"
 
+      - name: Kernel from this run (called by xnu.yml)
+        if: inputs.payload == 'kernel' && inputs.same_run
+        uses: actions/download-artifact@v4
+        with:
+          name: xnu-kernel-guamna
+          path: xnu/out
+
       - name: XNU payload (payload=kernel)
         if: inputs.payload == 'kernel'
         run: |
           mkdir -p xnu/out shim/out
-          for run in $(gh run list -R "$GITHUB_REPOSITORY" -w xnu.yml --status success -L 20 --json databaseId -q '.[].databaseId'); do
+          [ -f xnu/out/kernel.development.guamna ] && echo "kernel from this run ($GITHUB_RUN_ID)"
+          [ -f xnu/out/kernel.development.guamna ] || for run in $(gh run list -R "$GITHUB_REPOSITORY" -w xnu.yml --status success -L 20 --json databaseId -q '.[].databaseId'); do
             if gh run download "$run" -R "$GITHUB_REPOSITORY" -n xnu-kernel-guamna -D xnu/out 2>/dev/null; then
               echo "kernel from xnu run $run"; break
             fi
