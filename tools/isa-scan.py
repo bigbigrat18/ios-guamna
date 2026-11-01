@@ -80,17 +80,54 @@ def main():
     imgs = images(main_blob) if mappings(main_blob) else []
     img_addrs = np.array([a for a, _ in imgs], dtype=np.uint64)
 
+    # Map every file's mappings: vmaddr -> (blob, file offset). Scanning whole
+    # executable mappings counts __TEXT data (__const, __cstring, unwind info)
+    # too, which at ~1 hit per 512 random words swamps the result (the A9-only
+    # iPad 5 cache "had" 200k LSE instructions). Scan only the code sections.
+    blobs, segs = [], []
+    for path in files:
+        blob = main_blob if path == base else open(path, 'rb').read()
+        blobs.append(blob)
+        for addr, size, foff, initp in mappings(blob) or []:
+            segs.append((addr, size, foff, len(blobs) - 1))
+    segs.sort()
+
+    def read(vaddr, n):
+        for a, s, f, b in segs:
+            if a <= vaddr < a + s:
+                o = f + (vaddr - a)
+                return blobs[b], o, min(n, a + s - vaddr)
+        return None, 0, 0
+
+    def code_sections(img_addr):
+        blob, o, _ = read(img_addr, 32)
+        if blob is None or struct.unpack_from('<I', blob, o)[0] != 0xfeedfacf:
+            return []
+        ncmds = struct.unpack_from('<I', blob, o + 16)[0]
+        p, out = o + 32, []
+        for _ in range(ncmds):
+            cmd, size = struct.unpack_from('<II', blob, p)
+            if cmd == 0x19:                      # LC_SEGMENT_64
+                nsects = struct.unpack_from('<I', blob, p + 64)[0]
+                for s in range(nsects):
+                    q = p + 72 + 80 * s
+                    addr, sz = struct.unpack_from('<QQ', blob, q + 32)
+                    flags = struct.unpack_from('<I', blob, q + 64)[0]
+                    if flags & 0x80000400:       # S_ATTR_PURE_INSTRUCTIONS | SOME_INSTRUCTIONS
+                        out.append((addr, sz))
+            p += size
+        return out
+
     totals = {k: 0 for k in list(PATTERNS) + list(BASELINE)}
     per_image = {}
     examples = []
     n_words = 0
-    for path in files:
-        blob = main_blob if path == base else open(path, 'rb').read()
-        maps = mappings(blob)
-        for addr, size, foff, initp in maps or []:
-            if not initp & 4 or size == 0:
+    for img_addr, img_path in imgs:
+        for saddr, ssize in code_sections(img_addr):
+            blob, off, n = read(saddr, ssize)
+            if blob is None:
                 continue
-            words = np.frombuffer(blob, dtype='<u4', count=size // 4, offset=foff)
+            words = np.frombuffer(blob, dtype='<u4', count=n // 4, offset=off)
             n_words += words.size
             for name, pats in list(PATTERNS.items()) + list(BASELINE.items()):
                 hit = match(words, pats)
@@ -100,16 +137,12 @@ def main():
                 totals[name] += idx.size
                 if name in BASELINE or idx.size == 0:
                     continue
-                vaddrs = np.uint64(addr) + idx.astype(np.uint64) * np.uint64(4)
-                owners = np.searchsorted(img_addrs, vaddrs, side='right') - 1 if img_addrs.size else np.full(idx.size, -1)
-                for o in np.unique(owners):
-                    key = imgs[o][1] if o >= 0 else '?'
-                    per_image.setdefault(key, {}).setdefault(name, 0)
-                    per_image[key][name] += int((owners == o).sum())
+                per_image.setdefault(img_path, {}).setdefault(name, 0)
+                per_image[img_path][name] += int(idx.size)
                 for k in idx[:2]:
-                    examples.append((name, addr + 4 * int(k), int(words[k])))
+                    examples.append((name, saddr + 4 * int(k), int(words[k])))
 
-    print(f'# ARMv8.0 check: {os.path.basename(base)} ({len(files)} files, {n_words:,} words in executable mappings)\n')
+    print(f'# ARMv8.0 check: {os.path.basename(base)} ({len(files)} files, {n_words:,} words in code sections of {len(imgs)} images)\n')
     print('| instruction group | words matching |')
     print('|---|---|')
     for k, v in totals.items():
