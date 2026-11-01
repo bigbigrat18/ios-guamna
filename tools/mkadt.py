@@ -344,7 +344,11 @@ def build_guamna(seed=None):
         cpu_nodes.append(node(f'cpu{i}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,kryo240') + cstr('ARM,v8')),
+            # SweetCPU (iokit/KernelConfigTables.cpp) matches IONameMatch
+            # 'qcom,kryo470'. Without it no CPU driver starts, the boot CPU
+            # never enables its interrupts, and the kernel hangs at its first
+            # timed wait (first guamna boots: stuck after AppleCLCD).
+            ('compatible', cstr('qcom,kryo240') + cstr('qcom,kryo470') + cstr('ARM,v8')),
             ('reg', u32(cluster << 8 | core)),   # MPIDR Aff1:Aff0
             ('cpu-id', u32(i)),
             ('cluster-id', u32(0)),             # one SMP cluster for XNU, as on sweet

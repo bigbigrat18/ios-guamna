@@ -212,6 +212,10 @@ GUAMNA-specific build fixes found by CI:
   backtrace symbolized against the CI kernel). GUAMNA rounds the leaf index
   to PAGE_RATIO. Before that the boot sometimes just stopped silently after
   `SWEET FB: AppleCLCD`.
+- **ADT `compatible` of the CPUs** must include `qcom,kryo470` (SweetCPU's
+  IONameMatch). With only `qcom,kryo240` no CPU driver started and the kernel
+  hung after `SWEET FB: AppleCLCD` with no timer interrupts, although the
+  shim's GIC test showed vtimer, ptimer and SGI all working (30/30/10).
 - **libfirehose_kernel** is built by `xcodebuild` for `arm64-apple-macos`, so
   Apple clang's default `apple-m1` CPU put 12 LSE/LDAPR instructions into the
   kernel. `.github/scripts/guamna-firehose-cpu.py` gives its arm64 slice
