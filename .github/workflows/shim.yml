@@ -1,0 +1,111 @@
+name: shim
+
+# Builds the guamna boot shim (shim/) into a `fastboot boot`-able image.
+#
+# Input: the phone's own boot.img (stock or Magisk-patched LineageOS; only its
+# DTB and header geometry are used). Keep it OUT of git: upload it as an asset
+# of a DRAFT release named "guamna-boot" (drafts are only visible to people
+# with write access). See docs/PORTING_GUAMNA.md, "Shim in CI".
+#
+# payload = none   -> probe screen: CPU features, PSCI, GIC (milestone 1)
+# payload = kernel -> latest xnu-kernel-guamna artifact + mkadt --board guamna
+#                     + mkpayload, so the shim boots XNU
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: none = probe screen; kernel = boot the latest GUAMNA XNU build
+        type: choice
+        options: [none, kernel]
+        default: none
+      cmdline:
+        description: XNU boot-args (payload=kernel)
+        default: "debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress"
+      release:
+        description: Name of the draft release holding boot.img
+        default: guamna-boot
+
+permissions:
+  contents: write   # needed to see draft releases
+  actions: read     # needed to download the kernel artifact
+
+jobs:
+  shim:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu mkbootimg cpio
+          command -v mkbootimg aarch64-linux-gnu-gcc
+
+      - name: Fetch boot.img from the draft release
+        run: |
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq '.[] | select(.draft and .name == "${{ inputs.release }}") | .assets[] | select(.name | endswith(".img")) | .id' | head -1)
+          if [ -z "$id" ]; then
+            echo "::error::No .img asset in a draft release named '${{ inputs.release }}'. Releases > Draft a new release > title '${{ inputs.release }}' > attach boot.img > Save draft."
+            exit 1
+          fi
+          mkdir -p private
+          gh api -H "Accept: application/octet-stream" "repos/$GITHUB_REPOSITORY/releases/assets/$id" > private/boot.img
+          ls -l private/boot.img
+          head -c 8 private/boot.img | grep -q 'ANDROID!' || { echo "::error::not an Android boot image"; exit 1; }
+
+      - name: Unpack DTB and header geometry
+        run: |
+          python3 tools/unpack_bootv2.py private/boot.img private/unpacked > /dev/null
+          grep -v '^cmdline' private/unpacked/header.txt
+          grep -q '^header_version: 2$' private/unpacked/header.txt || {
+            echo "::error::need a boot image header v2 with the DTB inside (guamna launched on Android 10)"; exit 1; }
+          [ -s private/unpacked/dtb ] || { echo "::error::boot.img has no DTB section"; exit 1; }
+          python3 - <<'EOF' >> "$GITHUB_ENV"
+          h = dict(l.split(': ', 1) for l in open('private/unpacked/header.txt').read().splitlines() if ': ' in l)
+          osv = int(h['os_version'], 16)
+          ver, lvl = osv >> 11, osv & 0x7ff
+          print(f"KERNEL_OFFSET={h['kernel_addr']}")
+          print(f"RAMDISK_OFFSET={h['ramdisk_addr']}")
+          print(f"TAGS_OFFSET={h['tags_addr']}")
+          print(f"DTB_OFFSET={h['dtb_addr']}")
+          print(f"PAGESIZE={h['page_size']}")
+          if osv:
+              print(f"OS_VERSION={ver >> 14}.{(ver >> 7) & 0x7f}.{ver & 0x7f}")
+              print(f"OS_PATCH_LEVEL={(lvl >> 4) + 2000}-{lvl & 0xf:02d}")
+          EOF
+          echo "DTB=$PWD/private/unpacked/dtb" >> "$GITHUB_ENV"
+
+      - name: XNU payload (payload=kernel)
+        if: inputs.payload == 'kernel'
+        run: |
+          mkdir -p xnu/out shim/out
+          for run in $(gh run list -R "$GITHUB_REPOSITORY" -w xnu.yml --status success -L 20 --json databaseId -q '.[].databaseId'); do
+            if gh run download "$run" -R "$GITHUB_REPOSITORY" -n xnu-kernel-guamna -D xnu/out 2>/dev/null; then
+              echo "kernel from xnu run $run"; break
+            fi
+          done
+          ls -l xnu/out/kernel.*.guamna
+          python3 tools/mkadt.py shim/out/guamna.adt --board guamna
+          python3 tools/mkpayload.py xnu/out/kernel.development.guamna shim/out/guamna.adt shim/out/payload.bin \
+            --cmdline "${{ inputs.cmdline }}"
+          echo "PAYLOAD=../shim/out/payload.bin" >> "$GITHUB_ENV"
+
+      - name: Build shim boot image
+        run: |
+          echo "geometry: kernel=$KERNEL_OFFSET ramdisk=$RAMDISK_OFFSET tags=$TAGS_OFFSET dtb=$DTB_OFFSET page=$PAGESIZE os=${OS_VERSION:-default} ${OS_PATCH_LEVEL:-}"
+          BOARD=guamna shim/build.sh ${PAYLOAD:-}
+          mkdir -p upload
+          cp shim/out/shim-boot.img "upload/shim-boot-guamna-${{ inputs.payload }}.img"
+          [ -f shim/out/guamna.adt ] && cp shim/out/guamna.adt upload/ || true
+          sha256sum upload/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shim-boot-guamna-${{ inputs.payload }}
+          path: upload/
+          retention-days: 14

@@ -218,6 +218,19 @@ gh workflow run xnu.yml -R YOU/ios-sweet -f machine_config=GUAMNA
 gh run download RUN_ID -R YOU/ios-sweet -n xnu-kernel-guamna -D xnu/out
 ```
 
+### Shim in CI (`.github/workflows/shim.yml`)
+
+Builds `shim-boot.img` on Ubuntu from the phone's own `boot.img`: stock or
+Magisk-patched LineageOS, since only its DTB and header geometry are used.
+The image never goes into git:
+
+1. GitHub → Releases → *Draft a new release*, title **`guamna-boot`**, attach
+   `boot.img`, then **Save draft** (drafts are visible only to people with write access).
+2. Actions → **shim** → Run workflow: `payload=none` gives the probe screen,
+   `payload=kernel` packs the latest `xnu-kernel-guamna` build with
+   `mkadt --board guamna`.
+3. Download the `shim-boot-guamna-*` artifact, then `fastboot boot shim-boot-guamna-none.img`.
+
 ## 7. Bring-up order
 
 1. **Live FDT**: `adb root && adb pull /sys/firmware/fdt guamna-live.dtb`, then

@@ -33,10 +33,13 @@ if [ -n "${1:-}" ]; then
 else
 	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
+# Boot image geometry: sweet's stock values unless overridden (the guamna CI
+# job takes them from the phone's own boot.img header, see .github/workflows/shim.yml).
 mkbootimg --header_version 2 --kernel out/Image --ramdisk out/ramdisk.bin \
-	--dtb ../dtb/boot_unpacked/dtb --base 0 --kernel_offset 0x8000 --ramdisk_offset 0x1000000 \
-	--tags_offset 0x100 --dtb_offset 0x1f00000 --pagesize 4096 \
-	--os_version 17.0.0 --os_patch_level 2035-06 \
+	--dtb "${DTB:-../dtb/boot_unpacked/dtb}" --base 0 --kernel_offset "${KERNEL_OFFSET:-0x8000}" \
+	--ramdisk_offset "${RAMDISK_OFFSET:-0x1000000}" \
+	--tags_offset "${TAGS_OFFSET:-0x100}" --dtb_offset "${DTB_OFFSET:-0x1f00000}" --pagesize "${PAGESIZE:-4096}" \
+	--os_version "${OS_VERSION:-17.0.0}" --os_patch_level "${OS_PATCH_LEVEL:-2035-06}" \
 	--cmdline "console=null" -o out/shim-boot.img
 # Host render of the console layout.
 gcc -O1 -Wall $([ "$BOARD" = guamna ] && echo -DBOARD_GUAMNA) -o out/host_test console.c host_test.c && ./out/host_test
