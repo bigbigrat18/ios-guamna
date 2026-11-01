@@ -15,6 +15,7 @@ Prints, with absolute physical addresses (bus `ranges` applied):
   - a GUAMNA = dict(...) snippet for tools/mkadt.py.
 Pure standard library, no dtc needed. Device dumps belong outside git.
 """
+import re
 import struct
 import sys
 
@@ -191,7 +192,10 @@ def main():
                 if k in n.props:
                     print('chosen %s = 0x%x' % (k, join(n.cells(k))))
             if 'bootargs' in n.props:
-                print('chosen bootargs = %s' % n.str('bootargs')[:300])
+                # Serial numbers, MACs and similar identifiers: never print them.
+                args = re.sub(r'\b([\w.]*(serial|serialno|mac|imei|cid|uid|hwid|ufs_id|emmc_id|sn)[\w.]*)=\S+',
+                              r'\1=<redacted>', n.str('bootargs'), flags=re.I)
+                print('chosen bootargs = %s' % args[:300])
 
     # ---- memory ----
     banks = []
