@@ -11,6 +11,13 @@
   header cmdline (shim.yml copies it). XNU (0086) boots to its fbcon console
   through pmap/VM bootstrap, then panics in kmem_range_init (claim "zones")
   -> 0087. Photos in chat only.
+- **2026-11-01 PHONE MILESTONE: XNU (0090) boots to `Waiting on <dict>
+  IOProviderClass IOMedia, Content Apple_HFS`**: Skywalk self-tests PASSED,
+  lo0/gif0/stf0 attached, sweethidtest key events every 3 s (timer IRQs work).
+  Root cause of the IRQ hang: at SweetCPU start the boot CPU's GICR
+  ISENABLER0/IPRIORITYR read 0 (0089 diagnostics) although pe_init_fiq wrote
+  them; 0090 re-applies them in initCPU. Why they get lost is still open
+  (0090 also prints them right after pe_init_fiq).
 - ISA check done: iPhone X 20H392 userland is usable on ARMv8.0 (v8.1+ code
   only in runtime-dispatched paths; identical counts in the A9 iPad 5 cache).
   Kernel 0088 + CPU-compatible ADT fix: SweetCPU starts, then no timer IRQs
