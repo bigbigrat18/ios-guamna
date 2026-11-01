@@ -18,7 +18,7 @@ on:
         description: macOS runner. macos-15 = Xcode 16 (needs patch 0084); macos-15-intel = same on Intel (separate, often shorter queue); macos-14 = Xcode 15, retired 2026-11-02
         type: choice
         options: [macos-14, macos-15, macos-15-intel]
-        default: macos-15
+        default: macos-15-intel
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
@@ -58,7 +58,7 @@ jobs:
       MACHINE_CONFIG: ${{ matrix.machine }}
     # macos-14 shipped Xcode 15 (iig matched xnu-8796); it retired 2026-11-02.
     # Xcode 16 iig emits IORPC.kernelContent: patch 0084 backports the field.
-    runs-on: ${{ inputs.runner || 'macos-15' }}
+    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
