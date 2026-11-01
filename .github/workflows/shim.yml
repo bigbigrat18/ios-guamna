@@ -130,8 +130,15 @@ jobs:
       - name: Build shim boot image
         run: |
           echo "geometry: kernel=$KERNEL_OFFSET ramdisk=$RAMDISK_OFFSET tags=$TAGS_OFFSET dtb=$DTB_OFFSET page=$PAGESIZE os=${OS_VERSION:-default} ${OS_PATCH_LEVEL:-}"
-          BOARD=guamna shim/build.sh ${PAYLOAD:-}
           mkdir -p upload
+          if [ "${{ inputs.payload }}" = none ]; then
+            # Bisection images: s<n> parks the CPU forever after step n (shim.c STOP_AT)
+            for n in 0 1 2 3 4; do
+              SHIM_EXTRA_CFLAGS="-DSHIM_STOP=$n" BOARD=guamna shim/build.sh > /dev/null
+              cp shim/out/shim-boot.img "upload/shim-boot-guamna-s$n.img"
+            done
+          fi
+          BOARD=guamna shim/build.sh ${PAYLOAD:-}
           cp shim/out/shim-boot.img "upload/shim-boot-guamna-${{ inputs.payload }}.img"
           [ -f shim/out/guamna.adt ] && cp shim/out/guamna.adt upload/ || true
           sha256sum upload/*

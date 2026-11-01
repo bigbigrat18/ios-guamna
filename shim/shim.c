@@ -368,16 +368,42 @@ static void test_gic(void)
 #define MDSS_BASE		0x05e00000UL	/* SDE: DSI ctrl is at +0x94000 in the live FDT */
 static uint32_t wdt_en_was, scan_pipe, scan_addr, scan_stride, scan_size, scan_fmt;
 
+/*
+ * Bisection builds (-DSHIM_STOP=n, see .github/workflows/shim.yml): park the
+ * CPU forever after step n. Whichever image still resets the phone within
+ * seconds names the access that kills it; s0 resetting means ABL itself
+ * rejects the image.
+ */
+#ifdef SHIM_STOP
+static void __attribute__((noreturn)) park(void)
+{
+	for (;;)
+		__asm__ volatile("wfe");
+}
+#define STOP_AT(n)	do { if (SHIM_STOP == (n)) park(); } while (0)
+#else
+#define STOP_AT(n)	do { } while (0)
+#endif
+
 static void guamna_early(void)
 {
+	STOP_AT(0);
 	stage = "imem";
 	wr32(IMEM_RESTART_REASON, RESTART_BOOTLOADER);
 	__asm__ volatile("dsb sy" ::: "memory");
+	STOP_AT(1);
 	stage = "wdt";
 	wdt_en_was = rd32(WDT_BASE + WDT_EN);
 	wr32(WDT_BASE + WDT_RST, 1);
 	wr32(WDT_BASE + WDT_EN, 0);
 	__asm__ volatile("dsb sy" ::: "memory");
+	STOP_AT(2);
+#ifdef SHIM_STOP
+	stage = "fill";
+	con_clear(WHITE);	/* default geometry: 720x1600x4 at FB_BASE */
+	__asm__ volatile("dsb sy" ::: "memory");
+	STOP_AT(3);
+#endif
 	stage = "mdss";
 	static const uint32_t pipes[] = { 0x25000, 0x5000 };	/* DMA0, VIG0 */
 	for (unsigned i = 0; i < sizeof(pipes) / sizeof(pipes[0]); i++) {
@@ -401,6 +427,11 @@ static void guamna_early(void)
 		}
 		break;
 	}
+#ifdef SHIM_STOP
+	con_clear(RED);
+	__asm__ volatile("dsb sy" ::: "memory");
+	STOP_AT(4);
+#endif
 }
 
 static void report_early(void)

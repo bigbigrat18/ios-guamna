@@ -9,7 +9,7 @@ CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align
 BOARD=${BOARD:-sweet}
 case "$BOARD" in
 	sweet) ;;
-	guamna) CFLAGS="$CFLAGS -DBOARD_GUAMNA -mcpu=cortex-a53" ;;
+	guamna) CFLAGS="$CFLAGS -DBOARD_GUAMNA -mcpu=cortex-a53 ${SHIM_EXTRA_CFLAGS:-}" ;;
 	*) echo "error: unknown BOARD=$BOARD (sweet, guamna)" >&2; exit 1 ;;
 esac
 mkdir -p out
