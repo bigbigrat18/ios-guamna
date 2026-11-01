@@ -1,5 +1,7 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+
+**🎉 GUAMNA MILESTONE 2026-11-01 ~23:50 UTC: iOS 16.7.16 (iPhone X userland) reaches the LOCK SCREEN on the Moto G Play 2021.** Kernel 0091 (xnu runs 41353014257 / 41357196803, macos-15-intel), eMMC driver brings SDHC1 up from ABL's reset state (8-bit, 48 MHz), userdata = iosroot artifact `ios16-root-simg` (run 41343389800, SHA256 23dc39e0...81fe) flashed from LineageOS recovery's fastbootd with `-S 256M` (bootloader fastboot: "flash permission denied"; TWRP fastbootd: broken userdata). boot_b = shim run 41359972342 (cmdline + `sweetfb_noconsole=1 sweetfb_hz=30 sweetsample=-`). Apple logo ~10 min on 1 CPU, then dark frame, then lock screen (top of the clock visible: the 1125x2436 iPhone X canvas is shown as its centered 720x1600 crop). Next: downscale instead of crop, touch + keys for guamna, SMP (cpus=4 image from run 41362075364 untested).
 ### >>> guamna port (Moto G Play 2021, SM4250), branch `guamna-port`, 2026-11-01 <<<
 - Plan, file inventory and status: `docs/PORTING_GUAMNA.md`.
 - Repo: `bigbigrat18/ios-guamna`. CI is on macos-15/Xcode 16 (0084). GUAMNA
