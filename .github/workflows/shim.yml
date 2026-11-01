@@ -49,8 +49,16 @@ jobs:
       - name: Toolchain
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu mkbootimg cpio
-          command -v mkbootimg aarch64-linux-gnu-gcc
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu cpio
+          # Ubuntu's mkbootimg package lacks its gki module; use AOSP's, pinned.
+          git clone -q --depth 1 --branch android-15.0.0_r1 \
+            https://android.googlesource.com/platform/system/tools/mkbootimg "$RUNNER_TEMP/mkbootimg"
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/bin/sh\nexec python3 "%s/mkbootimg.py" "$@"\n' "$RUNNER_TEMP/mkbootimg" > "$RUNNER_TEMP/bin/mkbootimg"
+          chmod +x "$RUNNER_TEMP/bin/mkbootimg"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/mkbootimg" --help > /dev/null
+          command -v aarch64-linux-gnu-gcc
 
       - name: Fetch boot.img from LineageOS
         if: inputs.boot_source == 'lineage'
