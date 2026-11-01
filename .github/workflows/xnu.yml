@@ -15,9 +15,9 @@ on:
         options: [SWEET, GUAMNA, ALL]
         default: SWEET
       runner:
-        description: macOS runner. macos-15 = Xcode 16 (needs patch 0084); macos-14 = Xcode 15, retired 2026-11-02
+        description: macOS runner. macos-15 = Xcode 16 (needs patch 0084); macos-15-intel = same on Intel (separate, often shorter queue); macos-14 = Xcode 15, retired 2026-11-02
         type: choice
-        options: [macos-14, macos-15]
+        options: [macos-14, macos-15, macos-15-intel]
         default: macos-15
       keep_going:
         description: make -k (collect all compile errors in one run)
