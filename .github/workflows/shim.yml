@@ -136,7 +136,23 @@ jobs:
             for n in 0 1 2 3 4; do
               SHIM_EXTRA_CFLAGS="-DSHIM_STOP=$n" BOARD=guamna shim/build.sh > /dev/null
               cp shim/out/shim-boot.img "upload/shim-boot-guamna-s$n.img"
+              [ $n = 0 ] && cp shim/out/Image private/shim-s0-Image && cp shim/out/ramdisk.bin private/empty-ramdisk.bin
             done
+            # Hybrids with the LineageOS image, to find what ABL refuses in ours:
+            #   h1 = LOS kernel + LOS ramdisk + LOS cmdline (our repacking only)
+            #   h2 = shim s0   + LOS ramdisk + LOS cmdline
+            #   h3 = shim s0   + empty ramdisk + LOS cmdline   (s0 = + "console=null")
+            los_cmdline=$(sed -n 's/^cmdline: //p' private/unpacked/header.txt)
+            echo "LineageOS header cmdline: $los_cmdline"
+            hyb() {
+              mkbootimg --header_version 2 --kernel "$1" --ramdisk "$2" --dtb "$DTB" --base 0 \
+                --kernel_offset "$KERNEL_OFFSET" --ramdisk_offset "$RAMDISK_OFFSET" --tags_offset "$TAGS_OFFSET" \
+                --dtb_offset "$DTB_OFFSET" --pagesize "$PAGESIZE" --os_version "$OS_VERSION" \
+                --os_patch_level "$OS_PATCH_LEVEL" --cmdline "$los_cmdline" -o "$3"
+            }
+            hyb private/unpacked/kernel private/unpacked/ramdisk upload/shim-boot-guamna-h1.img
+            hyb private/shim-s0-Image  private/unpacked/ramdisk upload/shim-boot-guamna-h2.img
+            hyb private/shim-s0-Image  private/empty-ramdisk.bin upload/shim-boot-guamna-h3.img
           fi
           BOARD=guamna shim/build.sh ${PAYLOAD:-}
           cp shim/out/shim-boot.img "upload/shim-boot-guamna-${{ inputs.payload }}.img"
