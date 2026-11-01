@@ -1,0 +1,19 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 00568d3..353f232 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -10892,6 +10892,14 @@ pmap_create_commpages(vm_map_address_t *kernel_data_addr, vm_map_address_t *kern
+ 
+ 	do {
+ 		int text_leaf_index = random() % num_ptes;
++#if defined(ARM64_BOARD_CONFIG_GUAMNA)
++		/*
++		 * GUAMNA runs 16K VM pages over 4K leaf PTEs (PAGE_RATIO 4, >1GB RAM):
++		 * a VM page must start on a PAGE_RATIO-aligned leaf, or
++		 * write_pte_fast panics "PTE write is unaligned".
++		 */
++		text_leaf_index &= ~(int)((PAGE_SIZE >> pt_attr_leaf_shift(pt_attr)) - 1);
++#endif
+ 
+ 		// Generate a VA for the commpage text with the same root and twig index as data
+ 		// comm page, but with new leaf index we've just generated.

@@ -206,6 +206,12 @@ GUAMNA-specific build fixes found by CI:
   pages** (arm_init.c, `PAGE_RATIO` 4), as Apple did on 4K-page SoCs. The
   phone's `vm_page_bootstrap: 79158 free pages` is 79158 × 16 KB = 1.24 GB, and
   iOS userland sees the 16 KB page size it was built for.
+- **0088**: the randomized commpage text page is placed at a random 4 KB
+  leaf, which is not a 16 KB VM page boundary 3 times out of 4 (third phone
+  boot: `write_pte_fast: PTE write is unaligned` from `pmap_create_commpages`,
+  backtrace symbolized against the CI kernel). GUAMNA rounds the leaf index
+  to PAGE_RATIO. Before that the boot sometimes just stopped silently after
+  `SWEET FB: AppleCLCD`.
 - **libfirehose_kernel** is built by `xcodebuild` for `arm64-apple-macos`, so
   Apple clang's default `apple-m1` CPU put 12 LSE/LDAPR instructions into the
   kernel. `.github/scripts/guamna-firehose-cpu.py` gives its arm64 slice
