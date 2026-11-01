@@ -2,10 +2,12 @@ name: shim
 
 # Builds the guamna boot shim (shim/) into a `fastboot boot`-able image.
 #
-# Input: the phone's own boot.img (stock or Magisk-patched LineageOS; only its
-# DTB and header geometry are used). Keep it OUT of git: upload it as an asset
-# of a DRAFT release named "guamna-boot" (drafts are only visible to people
-# with write access). See docs/PORTING_GUAMNA.md, "Shim in CI".
+# Input: a guamna boot.img; only its DTB and header geometry are used.
+#   boot_source = lineage (default): the newest official LineageOS guamna
+#                 boot.img, from download.lineageos.org, SHA-256 checked
+#   boot_source = draft: your own image, attached to a DRAFT release named
+#                 "guamna-boot" (never commit boot images to git)
+# See docs/PORTING_GUAMNA.md, "Shim in CI".
 #
 # payload = none   -> probe screen: CPU features, PSCI, GIC (milestone 1)
 # payload = kernel -> latest xnu-kernel-guamna artifact + mkadt --board guamna
@@ -22,8 +24,13 @@ on:
       cmdline:
         description: XNU boot-args (payload=kernel)
         default: "debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress"
+      boot_source:
+        description: lineage = official LineageOS guamna boot.img; draft = .img in the draft release below
+        type: choice
+        options: [lineage, draft]
+        default: lineage
       release:
-        description: Name of the draft release holding boot.img
+        description: Name of the draft release holding boot.img (boot_source=draft)
         default: guamna-boot
 
 permissions:
@@ -45,7 +52,24 @@ jobs:
           sudo apt-get install -y -qq gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu mkbootimg cpio
           command -v mkbootimg aarch64-linux-gnu-gcc
 
+      - name: Fetch boot.img from LineageOS
+        if: inputs.boot_source == 'lineage'
+        run: |
+          mkdir -p private
+          curl -fsS https://download.lineageos.org/api/v2/devices/guamna/builds > private/builds.json
+          read -r url sha date < <(python3 - <<'EOF'
+          import json
+          b = json.load(open('private/builds.json'))[0]
+          f = next(f for f in b['files'] if f['filename'] == 'boot.img')
+          print(f['url'], f['sha256'], b['date'])
+          EOF
+          )
+          echo "LineageOS guamna build $date: $url"
+          curl -fL --retry 3 -o private/boot.img "$url"
+          echo "$sha  private/boot.img" | sha256sum -c -
+
       - name: Fetch boot.img from the draft release
+        if: inputs.boot_source == 'draft'
         run: |
           id=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
             --jq '.[] | select(.draft and .name == "${{ inputs.release }}") | .assets[] | select(.name | endswith(".img")) | .id' | head -1)
