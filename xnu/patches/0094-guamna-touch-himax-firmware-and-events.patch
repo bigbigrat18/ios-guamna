@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/guamna_touch.c b/bsd/dev/guamna_touch.c
-index 6bd907b..c85828f 100644
+index 6bd907b..810c332 100644
 --- a/bsd/dev/guamna_touch.c
 +++ b/bsd/dev/guamna_touch.c
 @@ -27,6 +27,7 @@
@@ -46,13 +46,14 @@ index 6bd907b..c85828f 100644
  }
  
  /* Himax bus read: F3 cmd 00, then n bytes, one CS assertion. */
-@@ -402,37 +411,421 @@ hx_read(uint8_t cmd, uint8_t *data, unsigned n)
+@@ -402,37 +411,444 @@ hx_read(uint8_t cmd, uint8_t *data, unsigned n)
  	return err;
  }
  
 -/* AHB register read, 4 bytes (vendor himax_mcu_register_read, burst off). */
 +/* burst mode: 0x13 = 0x31 (continuous), 0x0D = 0x10 | auto-increment-4 */
-+static int
+ static int
+-hx_reg_read(uint32_t addr, uint8_t out[4])
 +hx_burst(bool incr4)
 +{
 +	int err = hx_write1(0x13, 0x31);
@@ -63,8 +64,7 @@ index 6bd907b..c85828f 100644
 +}
 +
 +/* AHB register read (vendor himax_mcu_register_read). */
- static int
--hx_reg_read(uint32_t addr, uint8_t out[4])
++static int
 +hx_reg_read(uint32_t addr, uint8_t *out, unsigned n)
  {
 -	uint8_t v;
@@ -76,16 +76,24 @@ index 6bd907b..c85828f 100644
 +	int err = hx_burst(n > 4);
 +	if (!err) {
 +		err = hx_write(0x00, a, 4);
-+	}
+ 	}
+-	v = 0x10;
+-	if ((err = hx_write(0x0d, &v, 1))) {
+-		return err;
 +	if (!err) {
 +		err = hx_write1(0x0c, 0x00);
 +	}
 +	if (!err) {
 +		err = hx_read(0x08, out, n);
-+	}
+ 	}
+-	if ((err = hx_write(0x00, a, 4))) {
+-		return err;
 +	if (n > 4) {
 +		(void)hx_burst(false);
-+	}
+ 	}
+-	v = 0x00;
+-	if ((err = hx_write(0x0c, &v, 1))) {
+-		return err;
 +	return err;
 +}
 +
@@ -248,10 +256,7 @@ index 6bd907b..c85828f 100644
 +		if ((v & 0xffff) == 0x01ec) {
 +			return true;
 +		}
- 	}
--	v = 0x10;
--	if ((err = hx_write(0x0d, &v, 1))) {
--		return err;
++	}
 +	sum("reload to active fail");
 +	return false;
 +}
@@ -331,9 +336,7 @@ index 6bd907b..c85828f 100644
 +	if (cfg_sz > sizeof(hx_cfg)) {
 +		sum("cfg %u too big", cfg_sz);
 +		return false;
- 	}
--	if ((err = hx_write(0x00, a, 4))) {
--		return err;
++	}
 +	/* part 0: main code, its CRC over itself is 0 */
 +	const uint8_t *e0 = tab;
 +	uint32_t sram0 = (uint32_t)e0[0] | (uint32_t)e0[1] << 8 | (uint32_t)e0[2] << 16 | (uint32_t)e0[3] << 24;
@@ -359,10 +362,7 @@ index 6bd907b..c85828f 100644
 +		}
 +	} else {
 +		reply = 0xff;
- 	}
--	v = 0x00;
--	if ((err = hx_write(0x0c, &v, 1))) {
--		return err;
++	}
 +	for (int i = 0; i < 5; i++) {
 +		int err = 0;
 +		(void)hx_reg_write32(0x10007ffcu, reply);       /* overlay handshake */
@@ -398,6 +398,10 @@ index 6bd907b..c85828f 100644
 +	int x[HX_MAX_PT] = { 0 }, y[HX_MAX_PT] = { 0 };
 +	uint32_t active = 0;
 +	unsigned logged = 0, errors = 0, dumped = 0, bad = 0;
++	int touchlog = 0, nohid = 0;
++	uint64_t next_log = 0;
++	(void)PE_parse_boot_argn("guamnatouchlog", &touchlog, sizeof(touchlog));
++	(void)PE_parse_boot_argn("guamnatouchnohid", &nohid, sizeof(nohid));
 +
 +	for (;;) {
 +		bool irq = !(rd(gt.tlmm, GT_PIN_IRQ * 0x1000u + 4u) & 1u);   /* INT is active low */
@@ -453,9 +457,28 @@ index 6bd907b..c85828f 100644
 +				}
 +			}
 +		}
-+		if (logged < 12 && (mask || active)) {
++		/* Debug (guamnatouchlog=1): every raw point, at most ~4 lines a second. */
++		if (touchlog && mach_absolute_time() >= next_log) {
++			char line[200];
++			int o = snprintf(line, sizeof(line), "cnt %02x st %02x%02x%02x:", buf[HX_PT_CNT],
++			    buf[HX_PT_CNT + 1], buf[HX_PT_CNT + 2], buf[HX_PT_CNT + 3]);
++			for (int i = 0; i < HX_MAX_PT && o > 0 && o < (int)sizeof(line) - 16; i++) {
++				int px = buf[4 * i] << 8 | buf[4 * i + 1];
++				int py = buf[4 * i + 2] << 8 | buf[4 * i + 3];
++				if (px != 0xffff || py != 0xffff) {
++					o += snprintf(line + o, sizeof(line) - (size_t)o, " %d:%d,%d", i, px, py);
++				}
++			}
++			printf("GUAMNA TOUCH: %s\n", line);
++			uint64_t t;
++			nanoseconds_to_absolutetime(250 * NSEC_PER_MSEC, &t);
++			next_log = mach_absolute_time() + t;
++		} else if (logged < 12 && (mask || active)) {
 +			logged++;
 +			printf("GUAMNA TOUCH: event cnt %#x mask %#x p0 %d,%d\n", buf[HX_PT_CNT], mask, nx[0], ny[0]);
++		}
++		if (nohid) {
++			mask = 0;               /* log only: nothing reaches iOS */
 +		}
 +		for (int i = 0; i < HX_MAX_PT; i++) {
 +			uint32_t bit = 1u << i;
@@ -486,7 +509,7 @@ index 6bd907b..c85828f 100644
  	gt_sleep(delay_s * 1000u);
  
  	gt.gcc = ml_io_map(GT_GCC_PA, 0x80000);
-@@ -442,18 +835,9 @@ gt_thread(__unused void *arg, __unused wait_result_t wr_)
+@@ -442,18 +858,9 @@ gt_thread(__unused void *arg, __unused wait_result_t wr_)
  		printf("GUAMNA TOUCH: MMIO map failed\n");
  		goto out;
  	}
@@ -505,7 +528,7 @@ index 6bd907b..c85828f 100644
  	gt_pin(6, 1, 0, 2);
  	gt_pin(7, 1, 0, 2);
  	gt_pin(71, 1, 0, 2);
-@@ -462,56 +846,43 @@ gt_thread(__unused void *arg, __unused wait_result_t wr_)
+@@ -462,56 +869,43 @@ gt_thread(__unused void *arg, __unused wait_result_t wr_)
  	if (!gt_se_init()) {
  		goto out;
  	}
