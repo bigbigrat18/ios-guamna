@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/guamna_touch.c b/bsd/dev/guamna_touch.c
-index 6bd907b..d101a99 100644
+index 6bd907b..e60004a 100644
 --- a/bsd/dev/guamna_touch.c
 +++ b/bsd/dev/guamna_touch.c
 @@ -27,6 +27,7 @@
@@ -96,10 +96,7 @@ index 6bd907b..d101a99 100644
 +	int err = hx_reg_read(addr, b, 4);
 +	if (errp && err) {
 +		*errp = err;
- 	}
--	v = 0x10;
--	if ((err = hx_write(0x0d, &v, 1))) {
--		return err;
++	}
 +	return (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
 +}
 +
@@ -120,9 +117,7 @@ index 6bd907b..d101a99 100644
 +		err = hx_write(0x00, buf, c + 4);
 +		done += c;
 +		delay(100);
- 	}
--	if ((err = hx_write(0x00, a, 4))) {
--		return err;
++	}
 +	return err;
 +}
 +
@@ -141,10 +136,7 @@ index 6bd907b..d101a99 100644
 +	int err = hx_reg_write32(0x80050020u, addr);
 +	if (!err) {
 +		err = hx_reg_write32(0x80050028u, 0x00990000u | (words & 0xffffu));
- 	}
--	v = 0x00;
--	if ((err = hx_write(0x0c, &v, 1))) {
--		return err;
++	}
 +	for (int i = 0; !err && i < 100; i++) {
 +		uint32_t st = hx_reg_read32(0x80050000u, &err);
 +		if (!(st & 1u)) {
@@ -336,7 +328,10 @@ index 6bd907b..d101a99 100644
 +	if (cfg_sz > sizeof(hx_cfg)) {
 +		sum("cfg %u too big", cfg_sz);
 +		return false;
-+	}
+ 	}
+-	v = 0x10;
+-	if ((err = hx_write(0x0d, &v, 1))) {
+-		return err;
 +	/* part 0: main code, its CRC over itself is 0 */
 +	const uint8_t *e0 = tab;
 +	uint32_t sram0 = (uint32_t)e0[0] | (uint32_t)e0[1] << 8 | (uint32_t)e0[2] << 16 | (uint32_t)e0[3] << 24;
@@ -347,10 +342,15 @@ index 6bd907b..d101a99 100644
 +	sum("parts %u main %u cfg %u border %d", parts, sz0, cfg_sz, border);
 +	if (off0 + sz0 > fwlen || !hx_write_crc(sram0, fw + off0, sz0, 0, "main")) {
 +		return false;
-+	}
+ 	}
+-	if ((err = hx_write(0x00, a, 4))) {
+-		return err;
 +	if (!hx_write_crc(base, hx_cfg, cfg_sz, hx_sw_crc(hx_cfg, cfg_sz), "cfg")) {
 +		return false;
-+	}
+ 	}
+-	v = 0x00;
+-	if ((err = hx_write(0x0c, &v, 1))) {
+-		return err;
 +	uint8_t reply = 0x66;                                   /* ovl_border_reply */
 +	if (border > 0) {
 +		const uint8_t *e = tab + border * 16;
@@ -536,7 +536,7 @@ index 6bd907b..d101a99 100644
  	gt_pin(6, 1, 0, 2);
  	gt_pin(7, 1, 0, 2);
  	gt_pin(71, 1, 0, 2);
-@@ -462,56 +877,50 @@ gt_thread(__unused void *arg, __unused wait_result_t wr_)
+@@ -462,56 +877,67 @@ gt_thread(__unused void *arg, __unused wait_result_t wr_)
  	if (!gt_se_init()) {
  		goto out;
  	}
@@ -580,9 +580,6 @@ index 6bd907b..d101a99 100644
 -					sum("FOUND");
 -				}
 -			}
--		}
--	}
--	if (!found) {
 +	/* Found on the phone (0093 probe): chip select 0, SPI mode 3. */
 +	wr(gt.se, SE_SPI_DEMUX, 0);
 +	wr(gt.se, SE_SPI_CPHA, 1);
@@ -593,7 +590,7 @@ index 6bd907b..d101a99 100644
 +	printf("GUAMNA TOUCH: IC ID err %d: %02x %02x %02x\n", e1, id[3], id[2], id[1]);
 +	sum("id %02x%02x%02x", id[3], id[2], id[1]);
 +	if (e1 || id[3] != 0x83 || id[2] != 0x10 || id[1] != 0x2d) {
- 		printf("GUAMNA TOUCH: HX83102D not found\n");
++		printf("GUAMNA TOUCH: HX83102D not found\n");
 +		goto out;
 +	}
 +	const uint8_t *fw = gt_firmware(&fwlen);
@@ -613,6 +610,25 @@ index 6bd907b..d101a99 100644
 +		    hx_reg_read32(0x800204f4u, &e), hx_reg_read32(0x10007f04u, &e), hx_reg_read32(0x10007088u, &e));
 +		sum("mode %#x", hx_reg_read32(0x10007088u, &e));
 +	}
++	{
++		/*
++		 * Run 3: normal mode (sorting 0x9999) yet the IC reports a "touch" on
++		 * every RX channel of one edge (x = 25 + 50 * rx, y = 20) with or
++		 * without a finger: a bad baseline. Restart the firmware once the
++		 * panel has settled (vendor resume path: reset + reload to active),
++		 * so it recalibrates. guamnatouchrecal=0 skips, =N waits N s.
++		 */
++		unsigned recal = 3;
++		(void)PE_parse_boot_argn("guamnatouchrecal", &recal, sizeof(recal));
++		if (recal) {
++			gt_sleep(recal * 1000u);
++			bool ok = hx_sense_on();
++			printf("GUAMNA TOUCH: recalibrate (reset + reload to active) %s\n", ok ? "ok" : "FAILED");
++			sum("recal %d", ok);
+ 		}
+ 	}
+-	if (!found) {
+-		printf("GUAMNA TOUCH: HX83102D not found\n");
 +	printf("GUAMNA TOUCH: firmware running, reading touches\n");
 +	sum("running");
 +	{
