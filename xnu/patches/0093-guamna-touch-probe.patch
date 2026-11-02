@@ -32,10 +32,10 @@ index a995682..640de63 100644
  
 diff --git a/bsd/dev/guamna_touch.c b/bsd/dev/guamna_touch.c
 new file mode 100644
-index 0000000..3c6be95
+index 0000000..799e6f4
 --- /dev/null
 +++ b/bsd/dev/guamna_touch.c
-@@ -0,0 +1,470 @@
+@@ -0,0 +1,511 @@
 +/*
 + * GUAMNA touch, step 1: talk to the Himax HX83102D (TDDI, "zero flash")
 + * on QUP0 SE2 SPI and read its IC ID. No firmware upload yet.
@@ -56,6 +56,7 @@ index 0000000..3c6be95
 + * Boot-args: guamnatouch=0 disables, guamnatouchdelay=N (s, default 5).
 + */
 +#if defined(ARM64_BOARD_CONFIG_GUAMNA)
++#include <stdarg.h>
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <sys/errno.h>
@@ -64,6 +65,8 @@ index 0000000..3c6be95
 +#include <kern/sched_prim.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include <kern/debug.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern kern_return_t thread_terminate(thread_t);
@@ -148,6 +151,28 @@ index 0000000..3c6be95
 +	uint32_t irq_seen;
 +} gt;
 +static int gt_chan;
++static char gt_sum[320];               /* summary for guamnatouchpanic=1 */
++
++static void
++sum(const char *fmt, ...) __printflike(1, 2);
++
++static void
++sum(const char *fmt, ...)
++{
++	size_t used = strlen(gt_sum);
++	va_list ap;
++	if (used + 3 >= sizeof(gt_sum)) {
++		return;
++	}
++	if (used) {
++		gt_sum[used++] = ';';
++		gt_sum[used++] = ' ';
++		gt_sum[used] = 0;
++	}
++	va_start(ap, fmt);
++	vsnprintf(gt_sum + used, sizeof(gt_sum) - used, fmt, ap);
++	va_end(ap);
++}
 +
 +static uint32_t
 +rd(vm_offset_t b, uint32_t off)
@@ -204,6 +229,7 @@ index 0000000..3c6be95
 +	uint32_t dfs = rd(gt.gcc, GT_RCG + 0x14u);
 +	printf("GUAMNA TOUCH: gcc vote %#x rcg %#x cfg %#x dfs %#x\n",
 +	    rd(gt.gcc, GT_GCC_VOTE), cmd, cfg, dfs);
++	sum("rcg %#x cfg %#x dfs %#x l0 %#x", cmd, cfg, dfs, rd(gt.gcc, GT_RCG + 0x1cu));
 +	if (dfs & 1u) {
 +		/* DFS: SE CLK_SEL 0 = perf level 0; use it only if it is XO/1 */
 +		uint32_t l0 = rd(gt.gcc, GT_RCG + 0x1cu);
@@ -225,6 +251,7 @@ index 0000000..3c6be95
 +	for (unsigned i = 0; i < sizeof(br) / sizeof(br[0]); i++) {
 +		if (!wait_clear(gt.gcc, br[i], 1u << 31)) {
 +			printf("GUAMNA TOUCH: GCC branch %#x off (%#x)\n", br[i], rd(gt.gcc, br[i]));
++			sum("branch %#x off %#x", br[i], rd(gt.gcc, br[i]));
 +			return false;
 +		}
 +	}
@@ -239,6 +266,7 @@ index 0000000..3c6be95
 +	gt.rx_depth = (rx >> 16) & 0x3fu;
 +	printf("GUAMNA TOUCH: se2 fw %#x proto %u status %#x if_dis %#x tx %#x rx %#x\n",
 +	    fw, (fw >> 8) & 0xffu, rd(gt.se, SE_STATUS), rd(gt.se, SE_IF_DIS), tx, rx);
++	sum("se fw %#x st %#x ifdis %#x tx %#x rx %#x", fw, rd(gt.se, SE_STATUS), rd(gt.se, SE_IF_DIS), tx, rx);
 +	if (((fw >> 8) & 0xffu) != 1u || (rd(gt.se, SE_IF_DIS) & 1u) ||
 +	    ((tx >> 24) & 0x3fu) != 32u || gt.tx_depth < 2 || gt.rx_depth < 2) {
 +		printf("GUAMNA TOUCH: SE2 has no SPI firmware / FIFO; stopping\n");
@@ -325,6 +353,7 @@ index 0000000..3c6be95
 +		gt.irq_seen |= irq;
 +		if (irq & M_ERRORS) {
 +			printf("GUAMNA TOUCH: xfer error irq %#x\n", irq);
++			sum("xfer err irq %#x", irq);
 +			break;
 +		}
 +		if (tx && sent < len && (irq & M_TX_WM)) {
@@ -378,6 +407,7 @@ index 0000000..3c6be95
 +	}
 +	printf("GUAMNA TOUCH: xfer timeout irq %#x seen %#x status %#x\n",
 +	    rd(gt.se, SE_M_IRQ), gt.irq_seen, rd(gt.se, SE_STATUS));
++	sum("xfer tmo irq %#x seen %#x st %#x", rd(gt.se, SE_M_IRQ), gt.irq_seen, rd(gt.se, SE_STATUS));
 +	gt_abort();
 +	return ETIMEDOUT;
 +}
@@ -450,6 +480,9 @@ index 0000000..3c6be95
 +		printf("GUAMNA TOUCH: MMIO map failed\n");
 +		goto out;
 +	}
++	sum("pins %#x %#x %#x %#x irq %#x rst %#x", rd(gt.tlmm, 6 * 0x1000u), rd(gt.tlmm, 7 * 0x1000u),
++	    rd(gt.tlmm, 71 * 0x1000u), rd(gt.tlmm, 80 * 0x1000u), rd(gt.tlmm, GT_PIN_IRQ * 0x1000u),
++	    rd(gt.tlmm, GT_PIN_RST * 0x1000u));
 +	printf("GUAMNA TOUCH: pins 6 %#x 7 %#x 71 %#x 80 %#x irq67 %#x/%#x rst66 %#x/%#x\n",
 +	    rd(gt.tlmm, 6 * 0x1000u), rd(gt.tlmm, 7 * 0x1000u), rd(gt.tlmm, 71 * 0x1000u),
 +	    rd(gt.tlmm, 80 * 0x1000u), rd(gt.tlmm, GT_PIN_IRQ * 0x1000u),
@@ -472,6 +505,7 @@ index 0000000..3c6be95
 +	int e1 = hx_reg_read(0x900000d0u, id);
 +	printf("GUAMNA TOUCH: wake err %d (%#x), IC ID err %d: %02x %02x %02x %02x irq-seen %#x\n",
 +	    e0, wake, e1, id[3], id[2], id[1], id[0], gt.irq_seen);
++	sum("wake %d %#x id %d %02x%02x%02x%02x", e0, wake, e1, id[3], id[2], id[1], id[0]);
 +	if (!e1 && id[3] == 0x83 && id[2] == 0x10 && id[1] == 0x2d) {
 +		printf("GUAMNA TOUCH: found HX83102D\n");
 +	} else {
@@ -480,7 +514,14 @@ index 0000000..3c6be95
 +	/* Second read: sanity that the answer is stable. */
 +	e1 = hx_reg_read(0x900000d0u, id);
 +	printf("GUAMNA TOUCH: IC ID again err %d: %02x %02x %02x %02x\n", e1, id[3], id[2], id[1], id[0]);
++	sum("again %d %02x%02x%02x%02x", e1, id[3], id[2], id[1], id[0]);
 +out:
++	{
++		int stop = 0;
++		if (PE_parse_boot_argn("guamnatouchpanic", &stop, sizeof(stop)) && stop) {
++			panic("GUAMNA TOUCH probe: %s", gt_sum);
++		}
++	}
 +	(void)thread_terminate(current_thread());
 +	thread_block(THREAD_CONTINUE_NULL);
 +}
