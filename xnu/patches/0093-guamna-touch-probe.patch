@@ -1,0 +1,508 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 4e035f4..1219924 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/guamna_stubs.c			standard
+ bsd/dev/guamna_emmc.c			standard
++bsd/dev/guamna_touch.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/guamna_emmc.c b/bsd/dev/guamna_emmc.c
+index a995682..640de63 100644
+--- a/bsd/dev/guamna_emmc.c
++++ b/bsd/dev/guamna_emmc.c
+@@ -55,6 +55,7 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+ extern void sweet_sample_start(void);
++extern void guamna_touch_init(void);
+ 
+ /* SDHCI registers (offsets from the "hc" region) */
+ #define SD_BLKSIZE_CNT  0x04    /* [15:0] block size, [31:16] block count */
+@@ -1178,6 +1179,7 @@ guamna_emmc_init(void)
+ 	    want, se.first, se.nsect >> 11, se.writable ? "read-write" : "read-only", se.dma_pa);
+ 	guamna_log_start();
+ 	sweet_sample_start();
++	guamna_touch_init();
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/guamna_touch.c b/bsd/dev/guamna_touch.c
+new file mode 100644
+index 0000000..3c6be95
+--- /dev/null
++++ b/bsd/dev/guamna_touch.c
+@@ -0,0 +1,470 @@
++/*
++ * GUAMNA touch, step 1: talk to the Himax HX83102D (TDDI, "zero flash")
++ * on QUP0 SE2 SPI and read its IC ID. No firmware upload yet.
++ *
++ * Hardware (LineageOS kernel, bengal-guamna-touchscreen-overlay.dtsi):
++ *   SE2 SPI 0x04a88000, chip select 3, SPI mode 1 (CPHA), <= 10 MHz,
++ *   pins gpio6/7/71/80 function qup2 (mux 1), TLMM west tile 0x00500000,
++ *   IRQ gpio67 (input, pull-up), reset gpio66 (not touched here).
++ * GCC (drivers/clk/qcom/gcc-sm6115.c): vote 0x7900c bits 6/7 (wrap0 m/s
++ *   AHB), 8/9 (core, core2x), 12 (s2); s2 RCG 0x1f3a8, branch 0x1f3a4.
++ * Himax SPI framing (himax_platform_QCT_SPI.c): write = F2 cmd data...,
++ *   read = F3 cmd 00 then data, one chip-select assertion.
++ * IC ID: AHB register 0x900000D0 -> bytes [3..1] = 83 10 2D.
++ *
++ * The only writes to the IC are to its SPI-slave control registers
++ * (burst mode 0x13/0x0D, AHB address 0x00, direction 0x0C), exactly what
++ * the vendor driver does for any register read. The display is untouched.
++ * Boot-args: guamnatouch=0 disables, guamnatouchdelay=N (s, default 5).
++ */
++#if defined(ARM64_BOARD_CONFIG_GUAMNA)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++void guamna_touch_init(void);
++
++#define GT_SE_PA        0x04a88000u
++#define GT_GCC_PA       0x01400000u
++#define GT_TLMM_W_PA    0x00500000u
++#define GT_GCC_VOTE     0x7900cu
++#define GT_VOTE_BITS    ((1u << 6) | (1u << 7) | (1u << 8) | (1u << 9) | (1u << 12))
++#define GT_RCG          0x1f3a8u
++#define GT_CS           3u
++#define GT_PIN_IRQ      67u
++#define GT_PIN_RST      66u
++
++/* GENI SE registers (include/linux/qcom-geni-se.h) */
++#define SE_FORCE_DEF    0x020
++#define SE_OUTPUT_CTRL  0x024
++#define SE_CGC_CTRL     0x028
++#define SE_STATUS       0x040
++#define SE_MCLK         0x048
++#define SE_IF_DIS       0x064
++#define SE_FW           0x068
++#define SE_CLK_SEL      0x07c
++#define SE_SPI_CPHA     0x224
++#define SE_SPI_LOOP     0x22c
++#define SE_SPI_CPOL     0x230
++#define SE_SPI_INV      0x24c
++#define SE_SPI_DEMUX    0x250
++#define SE_BYTE_GRAN    0x254
++#define SE_DMA_MODE     0x258
++#define SE_SPI_TRANS    0x25c
++#define SE_TXPACK0      0x260
++#define SE_TXPACK1      0x264
++#define SE_SPI_WORDLEN  0x268
++#define SE_SPI_TXLEN    0x26c
++#define SE_SPI_RXLEN    0x270
++#define SE_SPI_DELAYS   0x278
++#define SE_RXPACK0      0x284
++#define SE_RXPACK1      0x288
++#define SE_M_CMD        0x600
++#define SE_M_CTRL       0x604
++#define SE_M_IRQ        0x610
++#define SE_M_IRQ_EN     0x614
++#define SE_M_IRQ_CLR    0x618
++#define SE_S_IRQ_EN     0x644
++#define SE_S_IRQ_CLR    0x648
++#define SE_TXFIFO       0x700
++#define SE_RXFIFO       0x780
++#define SE_TXSTAT       0x800
++#define SE_RXSTAT       0x804
++#define SE_TX_WM        0x80c
++#define SE_RX_WM        0x810
++#define SE_RX_RFR       0x814
++#define SE_GSI_EVT      0xe18
++#define SE_IRQ_EN       0xe1c
++#define SE_HW_TX        0xe24
++#define SE_HW_RX        0xe28
++#define SE_DMA_GEN      0xe30
++
++#define M_DONE          (1u << 0)
++#define M_ERRORS        ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5))
++#define M_RX_WM         (1u << 26)
++#define M_RX_LAST       (1u << 27)
++#define M_TX_WM         (1u << 30)
++#define M_EVENTS        (M_DONE | M_ERRORS | M_RX_WM | M_RX_LAST | M_TX_WM)
++
++#define SPI_TX_ONLY     1u
++#define SPI_RX_ONLY     2u
++#define SPI_FRAG        (1u << 2)
++
++/* se_get_packing_config(8, 4, msb_first): same words as I2C on sweet */
++#define SE_PACK0        0x0007f8feu
++#define SE_PACK1        0x000ffefeu
++
++static struct {
++	vm_offset_t se, gcc, tlmm;
++	unsigned tx_depth, rx_depth;
++	bool dead;
++	uint32_t irq_seen;
++} gt;
++static int gt_chan;
++
++static uint32_t
++rd(vm_offset_t b, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(b + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t b, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(b + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++gt_sleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&gt_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++wait_clear(vm_offset_t b, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; i++) {
++		if (!(rd(b, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* TLMM pin config: mux, pull (0 none, 3 up), drive field, output enable */
++static void
++gt_pin(unsigned pin, unsigned mux, unsigned pull, unsigned drv)
++{
++	uint32_t cfg = rd(gt.tlmm, pin * 0x1000u);
++	cfg &= ~0x3ffu;
++	cfg |= (mux << 2) | pull | (drv << 6);
++	wr(gt.tlmm, pin * 0x1000u, cfg);
++}
++
++static bool
++gt_clocks(void)
++{
++	wr(gt.gcc, GT_GCC_VOTE, rd(gt.gcc, GT_GCC_VOTE) | GT_VOTE_BITS);
++	uint32_t cmd = rd(gt.gcc, GT_RCG), cfg = rd(gt.gcc, GT_RCG + 4u);
++	uint32_t dfs = rd(gt.gcc, GT_RCG + 0x14u);
++	printf("GUAMNA TOUCH: gcc vote %#x rcg %#x cfg %#x dfs %#x\n",
++	    rd(gt.gcc, GT_GCC_VOTE), cmd, cfg, dfs);
++	if (dfs & 1u) {
++		/* DFS: SE CLK_SEL 0 = perf level 0; use it only if it is XO/1 */
++		uint32_t l0 = rd(gt.gcc, GT_RCG + 0x1cu);
++		printf("GUAMNA TOUCH: DFS level0 %#x\n", l0);
++		if ((l0 & 0x371fu) != 1u && (l0 & 0x371fu) != 0u) {
++			printf("GUAMNA TOUCH: DFS level0 not XO; stopping\n");
++			return false;
++		}
++	} else {
++		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;    /* XO, div 1: 19.2 MHz */
++		wr(gt.gcc, GT_RCG + 4u, cfg);
++		wr(gt.gcc, GT_RCG, rd(gt.gcc, GT_RCG) | 1u);
++		if (!wait_clear(gt.gcc, GT_RCG, 1u)) {
++			printf("GUAMNA TOUCH: RCG update timeout\n");
++			return false;
++		}
++	}
++	const uint32_t br[] = { 0x1f004, 0x1f008, 0x1f00c, 0x1f014, 0x1f3a4 };
++	for (unsigned i = 0; i < sizeof(br) / sizeof(br[0]); i++) {
++		if (!wait_clear(gt.gcc, br[i], 1u << 31)) {
++			printf("GUAMNA TOUCH: GCC branch %#x off (%#x)\n", br[i], rd(gt.gcc, br[i]));
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool
++gt_se_init(void)
++{
++	uint32_t fw = rd(gt.se, SE_FW), tx = rd(gt.se, SE_HW_TX), rx = rd(gt.se, SE_HW_RX);
++	gt.tx_depth = (tx >> 16) & 0x3fu;
++	gt.rx_depth = (rx >> 16) & 0x3fu;
++	printf("GUAMNA TOUCH: se2 fw %#x proto %u status %#x if_dis %#x tx %#x rx %#x\n",
++	    fw, (fw >> 8) & 0xffu, rd(gt.se, SE_STATUS), rd(gt.se, SE_IF_DIS), tx, rx);
++	if (((fw >> 8) & 0xffu) != 1u || (rd(gt.se, SE_IF_DIS) & 1u) ||
++	    ((tx >> 24) & 0x3fu) != 32u || gt.tx_depth < 2 || gt.rx_depth < 2) {
++		printf("GUAMNA TOUCH: SE2 has no SPI firmware / FIFO; stopping\n");
++		return false;
++	}
++	if (rd(gt.se, SE_STATUS) & 0x1001u) {
++		printf("GUAMNA TOUCH: SE2 busy; stopping\n");
++		return false;
++	}
++	wr(gt.se, SE_GSI_EVT, 0);
++	wr(gt.se, SE_IRQ_EN, 0);                /* polled */
++	wr(gt.se, SE_S_IRQ_EN, 0);
++	wr(gt.se, SE_M_IRQ_CLR, 0xffffffffu);
++	wr(gt.se, SE_S_IRQ_CLR, 0xffffffffu);
++	wr(gt.se, SE_DMA_MODE, 0);              /* FIFO mode */
++	wr(gt.se, SE_CGC_CTRL, rd(gt.se, SE_CGC_CTRL) | 0x7fu);
++	wr(gt.se, SE_DMA_GEN, rd(gt.se, SE_DMA_GEN) | 0x0fu);
++	wr(gt.se, SE_OUTPUT_CTRL, 0x7f);
++	wr(gt.se, SE_FORCE_DEF, 1);
++	wr(gt.se, SE_CLK_SEL, 0);
++	/* 19.2 MHz / 4 = 4.8 MHz SCLK (2.4 MHz if the core oversamples x2) */
++	wr(gt.se, SE_MCLK, (4u << 4) | 1u);
++	wr(gt.se, SE_MCLK + 4u, (4u << 4) | 1u);   /* GENI_SER_S_CLK_CFG */
++	wr(gt.se, SE_SPI_LOOP, 0);
++	wr(gt.se, SE_SPI_CPHA, 1);              /* spi-cpha */
++	wr(gt.se, SE_SPI_CPOL, 0);
++	wr(gt.se, SE_SPI_INV, 0);
++	wr(gt.se, SE_SPI_DEMUX, GT_CS);
++	wr(gt.se, SE_SPI_DELAYS, 0);
++	wr(gt.se, SE_SPI_WORDLEN, 8u - 4u);
++	wr(gt.se, SE_TXPACK0, SE_PACK0);
++	wr(gt.se, SE_TXPACK1, SE_PACK1);
++	wr(gt.se, SE_RXPACK0, SE_PACK0);
++	wr(gt.se, SE_RXPACK1, SE_PACK1);
++	wr(gt.se, SE_BYTE_GRAN, 0);
++	wr(gt.se, SE_TX_WM, 0);
++	wr(gt.se, SE_RX_WM, 0);
++	wr(gt.se, SE_RX_RFR, gt.rx_depth - 2u);
++	wr(gt.se, SE_M_IRQ_EN, M_EVENTS);
++	if ((rd(gt.se, SE_TXSTAT) & 0xfffffffu) || (rd(gt.se, SE_RXSTAT) & 0x1ffffffu)) {
++		printf("GUAMNA TOUCH: inherited FIFO data; stopping\n");
++		return false;
++	}
++	return true;
++}
++
++static void
++gt_abort(void)
++{
++	wr(gt.se, SE_M_CTRL, 2);                /* abort */
++	for (unsigned i = 0; i < 5000 && !(rd(gt.se, SE_M_IRQ) & (1u << 5)); i++) {
++		delay(1);
++	}
++	for (unsigned i = 0; i < 64 && (rd(gt.se, SE_RXSTAT) & 0x1ffffffu); i++) {
++		(void)rd(gt.se, SE_RXFIFO);
++	}
++	wr(gt.se, SE_M_IRQ_CLR, 0xffffffffu);
++	if (!wait_clear(gt.se, SE_STATUS, 1u)) {
++		gt.dead = true;
++		printf("GUAMNA TOUCH: abort failed; stopping\n");
++	}
++}
++
++/* One SPI transfer: tx-only or rx-only; frag keeps chip select asserted. */
++static int
++gt_xfer(const uint8_t *tx, uint8_t *rx, unsigned len, bool frag)
++{
++	unsigned sent = 0, got = 0;
++
++	if (gt.dead || len == 0 || len > 0xffffffu || (tx && rx)) {
++		return EIO;
++	}
++	if (!wait_clear(gt.se, SE_STATUS, 1u)) {
++		gt.dead = true;
++		return EBUSY;
++	}
++	wr(gt.se, SE_M_IRQ_CLR, 0xffffffffu);
++	wr(gt.se, SE_SPI_TRANS, 0);
++	wr(gt.se, tx ? SE_SPI_TXLEN : SE_SPI_RXLEN, len);
++	wr(gt.se, SE_TX_WM, tx ? 1u : 0u);
++	wr(gt.se, SE_M_CMD, ((tx ? SPI_TX_ONLY : SPI_RX_ONLY) << 27) | (frag ? SPI_FRAG : 0));
++	for (unsigned spin = 0; spin < 200000; spin++) {
++		uint32_t irq = rd(gt.se, SE_M_IRQ);
++		gt.irq_seen |= irq;
++		if (irq & M_ERRORS) {
++			printf("GUAMNA TOUCH: xfer error irq %#x\n", irq);
++			break;
++		}
++		if (tx && sent < len && (irq & M_TX_WM)) {
++			unsigned room = gt.tx_depth - 1u;
++			while (room-- && sent < len) {
++				uint32_t w = 0;
++				for (unsigned j = 0; j < 4 && sent < len; j++) {
++					w |= (uint32_t)tx[sent++] << (8u * j);
++				}
++				wr(gt.se, SE_TXFIFO, w);
++			}
++			if (sent == len) {
++				wr(gt.se, SE_TX_WM, 0);
++			}
++			wr(gt.se, SE_M_IRQ_CLR, M_TX_WM);
++		}
++		if (rx) {
++			uint32_t st = rd(gt.se, SE_RXSTAT);
++			uint32_t wc = st & 0x1ffffffu;
++			unsigned last_valid = (st & (1u << 31)) ? ((st >> 28) & 7u) : 0;
++			for (uint32_t k = 0; k < wc; k++) {
++				uint32_t w = rd(gt.se, SE_RXFIFO);
++				unsigned n = (k + 1 == wc && last_valid && last_valid < 4) ? last_valid : 4;
++				for (unsigned j = 0; j < n && got < len; j++) {
++					rx[got++] = (uint8_t)(w >> (8u * j));
++				}
++			}
++			if (irq & (M_RX_WM | M_RX_LAST)) {
++				wr(gt.se, SE_M_IRQ_CLR, irq & (M_RX_WM | M_RX_LAST));
++			}
++		}
++		if (irq & M_DONE) {
++			if (rx) {
++				/* final drain */
++				uint32_t wc = rd(gt.se, SE_RXSTAT) & 0x1ffffffu;
++				for (uint32_t k = 0; k < wc; k++) {
++					uint32_t w = rd(gt.se, SE_RXFIFO);
++					for (unsigned j = 0; j < 4 && got < len; j++) {
++						rx[got++] = (uint8_t)(w >> (8u * j));
++					}
++				}
++			}
++			wr(gt.se, SE_M_IRQ_CLR, irq);
++			if ((tx && sent == len) || (rx && got == len)) {
++				return 0;
++			}
++			printf("GUAMNA TOUCH: short xfer %u/%u/%u\n", sent, got, len);
++			return EIO;
++		}
++		delay(1);
++	}
++	printf("GUAMNA TOUCH: xfer timeout irq %#x seen %#x status %#x\n",
++	    rd(gt.se, SE_M_IRQ), gt.irq_seen, rd(gt.se, SE_STATUS));
++	gt_abort();
++	return ETIMEDOUT;
++}
++
++/* Himax bus write: F2 cmd data... */
++static int
++hx_write(uint8_t cmd, const uint8_t *data, unsigned n)
++{
++	uint8_t buf[16];
++	if (n > sizeof(buf) - 2) {
++		return EINVAL;
++	}
++	buf[0] = 0xf2;
++	buf[1] = cmd;
++	for (unsigned i = 0; i < n; i++) {
++		buf[2 + i] = data[i];
++	}
++	return gt_xfer(buf, NULL, n + 2, false);
++}
++
++/* Himax bus read: F3 cmd 00, then n bytes, one CS assertion. */
++static int
++hx_read(uint8_t cmd, uint8_t *data, unsigned n)
++{
++	const uint8_t hdr[3] = { 0xf3, cmd, 0x00 };
++	int err = gt_xfer(hdr, NULL, 3, true);
++	if (!err) {
++		err = gt_xfer(NULL, data, n, false);
++	}
++	return err;
++}
++
++/* AHB register read, 4 bytes (vendor himax_mcu_register_read, burst off). */
++static int
++hx_reg_read(uint32_t addr, uint8_t out[4])
++{
++	uint8_t v;
++	uint8_t a[4] = { (uint8_t)addr, (uint8_t)(addr >> 8), (uint8_t)(addr >> 16), (uint8_t)(addr >> 24) };
++	int err;
++	v = 0x31;
++	if ((err = hx_write(0x13, &v, 1))) {
++		return err;
++	}
++	v = 0x10;
++	if ((err = hx_write(0x0d, &v, 1))) {
++		return err;
++	}
++	if ((err = hx_write(0x00, a, 4))) {
++		return err;
++	}
++	v = 0x00;
++	if ((err = hx_write(0x0c, &v, 1))) {
++		return err;
++	}
++	return hx_read(0x08, out, 4);
++}
++
++static void
++gt_thread(__unused void *arg, __unused wait_result_t wr_)
++{
++	unsigned delay_s = 5;
++	(void)PE_parse_boot_argn("guamnatouchdelay", &delay_s, sizeof(delay_s));
++	printf("GUAMNA TOUCH: probe in %u s\n", delay_s);
++	gt_sleep(delay_s * 1000u);
++
++	gt.gcc = ml_io_map(GT_GCC_PA, 0x80000);
++	gt.tlmm = ml_io_map(GT_TLMM_W_PA, 0x51000);
++	gt.se = ml_io_map(GT_SE_PA, 0x4000);
++	if (!gt.gcc || !gt.tlmm || !gt.se) {
++		printf("GUAMNA TOUCH: MMIO map failed\n");
++		goto out;
++	}
++	printf("GUAMNA TOUCH: pins 6 %#x 7 %#x 71 %#x 80 %#x irq67 %#x/%#x rst66 %#x/%#x\n",
++	    rd(gt.tlmm, 6 * 0x1000u), rd(gt.tlmm, 7 * 0x1000u), rd(gt.tlmm, 71 * 0x1000u),
++	    rd(gt.tlmm, 80 * 0x1000u), rd(gt.tlmm, GT_PIN_IRQ * 0x1000u),
++	    rd(gt.tlmm, GT_PIN_IRQ * 0x1000u + 4u), rd(gt.tlmm, GT_PIN_RST * 0x1000u),
++	    rd(gt.tlmm, GT_PIN_RST * 0x1000u + 4u));
++	if (!gt_clocks()) {
++		goto out;
++	}
++	/* qup2 = mux 1, 6 mA (drive field 2), no pull; IRQ pin input pull-up */
++	gt_pin(6, 1, 0, 2);
++	gt_pin(7, 1, 0, 2);
++	gt_pin(71, 1, 0, 2);
++	gt_pin(80, 1, 0, 2);
++	gt_pin(GT_PIN_IRQ, 0, 3, 2);
++	if (!gt_se_init()) {
++		goto out;
++	}
++	uint8_t wake = 0, id[4] = { 0 };
++	int e0 = hx_read(0x13, &wake, 1);
++	int e1 = hx_reg_read(0x900000d0u, id);
++	printf("GUAMNA TOUCH: wake err %d (%#x), IC ID err %d: %02x %02x %02x %02x irq-seen %#x\n",
++	    e0, wake, e1, id[3], id[2], id[1], id[0], gt.irq_seen);
++	if (!e1 && id[3] == 0x83 && id[2] == 0x10 && id[1] == 0x2d) {
++		printf("GUAMNA TOUCH: found HX83102D\n");
++	} else {
++		printf("GUAMNA TOUCH: HX83102D not found\n");
++	}
++	/* Second read: sanity that the answer is stable. */
++	e1 = hx_reg_read(0x900000d0u, id);
++	printf("GUAMNA TOUCH: IC ID again err %d: %02x %02x %02x %02x\n", e1, id[3], id[2], id[1], id[0]);
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++guamna_touch_init(void)
++{
++	static bool started;
++	int enabled = 1;
++	thread_t thread;
++
++	if (started) {
++		return;
++	}
++	started = true;
++	(void)PE_parse_boot_argn("guamnatouch", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("GUAMNA TOUCH: disabled\n");
++		return;
++	}
++	if (kernel_thread_start(gt_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_GUAMNA */
