@@ -32,10 +32,10 @@ index a995682..640de63 100644
  
 diff --git a/bsd/dev/guamna_touch.c b/bsd/dev/guamna_touch.c
 new file mode 100644
-index 0000000..799e6f4
+index 0000000..6bd907b
 --- /dev/null
 +++ b/bsd/dev/guamna_touch.c
-@@ -0,0 +1,511 @@
+@@ -0,0 +1,541 @@
 +/*
 + * GUAMNA touch, step 1: talk to the Himax HX83102D (TDDI, "zero flash")
 + * on QUP0 SE2 SPI and read its IC ID. No firmware upload yet.
@@ -151,7 +151,7 @@ index 0000000..799e6f4
 +	uint32_t irq_seen;
 +} gt;
 +static int gt_chan;
-+static char gt_sum[320];               /* summary for guamnatouchpanic=1 */
++static char gt_sum[768];               /* summary for guamnatouchpanic=1 */
 +
 +static void
 +sum(const char *fmt, ...) __printflike(1, 2);
@@ -500,21 +500,51 @@ index 0000000..799e6f4
 +	if (!gt_se_init()) {
 +		goto out;
 +	}
-+	uint8_t wake = 0, id[4] = { 0 };
-+	int e0 = hx_read(0x13, &wake, 1);
-+	int e1 = hx_reg_read(0x900000d0u, id);
-+	printf("GUAMNA TOUCH: wake err %d (%#x), IC ID err %d: %02x %02x %02x %02x irq-seen %#x\n",
-+	    e0, wake, e1, id[3], id[2], id[1], id[0], gt.irq_seen);
-+	sum("wake %d %#x id %d %02x%02x%02x%02x", e0, wake, e1, id[3], id[2], id[1], id[0]);
-+	if (!e1 && id[3] == 0x83 && id[2] == 0x10 && id[1] == 0x2d) {
-+		printf("GUAMNA TOUCH: found HX83102D\n");
-+	} else {
++	/*
++	 * First probe (cs 3, mode 1) read all 0xff: nobody drives MISO. Try
++	 * every chip select and the SPI modes, then the same after a touch
++	 * reset pulse (vendor hx83102_pin_reset: low 20 ms, high 50 ms).
++	 */
++	static const uint8_t modes[3][2] = { { 1, 0 }, { 1, 1 }, { 0, 0 } };   /* cpha, cpol */
++	bool found = false;
++	for (unsigned pass = 0; pass < 2 && !found && !gt.dead; pass++) {
++		if (pass == 1) {
++			uint32_t io = GT_PIN_RST * 0x1000u + 4u;
++			wr(gt.tlmm, io, rd(gt.tlmm, io) & ~2u);
++			gt_sleep(20);
++			wr(gt.tlmm, io, rd(gt.tlmm, io) | 2u);
++			gt_sleep(50);
++			sum("reset pulse");
++		}
++		for (unsigned cs = 0; cs < 4 && !found && !gt.dead; cs++) {
++			for (unsigned m = 0; m < 3 && !found && !gt.dead; m++) {
++				uint8_t wake = 0, id[4] = { 0 };
++				wr(gt.se, SE_SPI_DEMUX, (cs + GT_CS) & 3u);      /* 3 first */
++				wr(gt.se, SE_SPI_CPHA, modes[m][0]);
++				wr(gt.se, SE_SPI_CPOL, modes[m][1] ? (1u << 2) : 0);
++				int e0 = hx_read(0x13, &wake, 1);
++				int e1 = hx_reg_read(0x900000d0u, id);
++				printf("GUAMNA TOUCH: pass %u cs %u cpha %u cpol %u: wake %d %#x id %d %02x %02x %02x %02x\n",
++				    pass, (cs + GT_CS) & 3u, modes[m][0], modes[m][1], e0, wake, e1,
++				    id[3], id[2], id[1], id[0]);
++				bool ff = id[0] == 0xff && id[1] == 0xff && id[2] == 0xff && id[3] == 0xff && wake == 0xff;
++				bool zero = !id[0] && !id[1] && !id[2] && !id[3] && !wake;
++				if (!(ff || zero) || m == 0) {
++					sum("p%u c%u m%u %d/%d %02x %02x%02x%02x%02x", pass, (cs + GT_CS) & 3u, m,
++					    e0, e1, wake, id[3], id[2], id[1], id[0]);
++				}
++				if (!e1 && id[3] == 0x83 && id[2] == 0x10) {
++					found = true;
++					printf("GUAMNA TOUCH: found HX8310%02x (pass %u cs %u mode %u)\n",
++					    id[1], pass, (cs + GT_CS) & 3u, m);
++					sum("FOUND");
++				}
++			}
++		}
++	}
++	if (!found) {
 +		printf("GUAMNA TOUCH: HX83102D not found\n");
 +	}
-+	/* Second read: sanity that the answer is stable. */
-+	e1 = hx_reg_read(0x900000d0u, id);
-+	printf("GUAMNA TOUCH: IC ID again err %d: %02x %02x %02x %02x\n", e1, id[3], id[2], id[1], id[0]);
-+	sum("again %d %02x%02x%02x%02x", e1, id[3], id[2], id[1], id[0]);
 +out:
 +	{
 +		int stop = 0;
