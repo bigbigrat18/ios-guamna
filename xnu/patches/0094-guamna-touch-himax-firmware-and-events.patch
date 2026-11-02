@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/guamna_touch.c b/bsd/dev/guamna_touch.c
-index 6bd907b..e60004a 100644
+index 6bd907b..f89f3e4 100644
 --- a/bsd/dev/guamna_touch.c
 +++ b/bsd/dev/guamna_touch.c
 @@ -27,6 +27,7 @@
@@ -46,14 +46,13 @@ index 6bd907b..e60004a 100644
  }
  
  /* Himax bus read: F3 cmd 00, then n bytes, one CS assertion. */
-@@ -402,37 +411,452 @@ hx_read(uint8_t cmd, uint8_t *data, unsigned n)
+@@ -402,37 +411,516 @@ hx_read(uint8_t cmd, uint8_t *data, unsigned n)
  	return err;
  }
  
 -/* AHB register read, 4 bytes (vendor himax_mcu_register_read, burst off). */
 +/* burst mode: 0x13 = 0x31 (continuous), 0x0D = 0x10 | auto-increment-4 */
- static int
--hx_reg_read(uint32_t addr, uint8_t out[4])
++static int
 +hx_burst(bool incr4)
 +{
 +	int err = hx_write1(0x13, 0x31);
@@ -64,7 +63,8 @@ index 6bd907b..e60004a 100644
 +}
 +
 +/* AHB register read (vendor himax_mcu_register_read). */
-+static int
+ static int
+-hx_reg_read(uint32_t addr, uint8_t out[4])
 +hx_reg_read(uint32_t addr, uint8_t *out, unsigned n)
  {
 -	uint8_t v;
@@ -96,7 +96,10 @@ index 6bd907b..e60004a 100644
 +	int err = hx_reg_read(addr, b, 4);
 +	if (errp && err) {
 +		*errp = err;
-+	}
+ 	}
+-	v = 0x10;
+-	if ((err = hx_write(0x0d, &v, 1))) {
+-		return err;
 +	return (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
 +}
 +
@@ -117,7 +120,9 @@ index 6bd907b..e60004a 100644
 +		err = hx_write(0x00, buf, c + 4);
 +		done += c;
 +		delay(100);
-+	}
+ 	}
+-	if ((err = hx_write(0x00, a, 4))) {
+-		return err;
 +	return err;
 +}
 +
@@ -158,7 +163,10 @@ index 6bd907b..e60004a 100644
 +		for (int j = 0; j < 32; j++) {
 +			crc = (crc & 1u) ? ((crc >> 1) & 0x7fffffffu) ^ 0x82f63b78u : (crc >> 1) & 0x7fffffffu;
 +		}
-+	}
+ 	}
+-	v = 0x00;
+-	if ((err = hx_write(0x0c, &v, 1))) {
+-		return err;
 +	return crc;
 +}
 +
@@ -267,6 +275,70 @@ index 6bd907b..e60004a 100644
 +	return (const uint8_t *)p;
 +}
 +
++/*
++ * DSI DCS commands (drivers/gpu/drm/msm/dsi/dsi_host.c, 6G layout: registers
++ * at ctrl base + 4). HX83102D must have its touch firmware in SRAM before
++ * the panel leaves sleep (Motorola reloads it on DRM_PANEL_EARLY_EVENT_BLANK,
++ * before the on-commands 0x11 / 0x29 of dsi-panel-moto-hx83102d-hlt-hdplus-
++ * video.dtsi). ABL woke the panel without it, so: display off, sleep in,
++ * upload, sleep out, display on. The one-word command buffer sits in the
++ * unused tail of the boot framebuffer carve-out, which MDSS already reads.
++ */
++#define DSI_PA          0x05e94000u
++#define DSI_CTRL        (4u + 0x000u)
++#define DSI_STATUS0     (4u + 0x004u)
++#define DSI_CMD_DMA     (4u + 0x038u)
++#define DSI_DMA_BASE    (4u + 0x044u)
++#define DSI_DMA_LEN     (4u + 0x048u)
++#define DSI_TRIG_CTRL   (4u + 0x080u)
++#define DSI_TRIG_DMA    (4u + 0x08cu)
++#define DSI_INTR_CTRL   (4u + 0x10cu)
++#define DSI_CMDBUF_PA   0x5ce00000u     /* fb carve-out 0x5c000000 + 15 MiB, offset 14 MiB */
++
++static vm_offset_t dsi_regs, dsi_buf;
++
++static int
++dsi_dcs(uint8_t cmd)
++{
++	if (!dsi_regs) {
++		dsi_regs = ml_io_map(DSI_PA, 0x1000);
++		dsi_buf = ml_io_map(DSI_CMDBUF_PA, 0x1000);
++		if (!dsi_regs || !dsi_buf) {
++			return ENXIO;
++		}
++		printf("GUAMNA DSI: ctrl %#x status %#x cmd_dma %#x trig %#x intr %#x\n",
++		    rd(dsi_regs, DSI_CTRL), rd(dsi_regs, DSI_STATUS0), rd(dsi_regs, DSI_CMD_DMA),
++		    rd(dsi_regs, DSI_TRIG_CTRL), rd(dsi_regs, DSI_INTR_CTRL));
++	}
++	/* MSM in-memory packet: DCS short write, no parameter (type 0x05), last */
++	wr(dsi_buf, 0, (uint32_t)cmd | (0x05u << 16) | (0x80u << 24));
++	uint32_t ctrl = rd(dsi_regs, DSI_CTRL);
++	uint32_t trig = rd(dsi_regs, DSI_TRIG_CTRL);
++	wr(dsi_regs, DSI_TRIG_CTRL, (trig & ~7u) | 4u | (1u << 12));       /* SW trigger, block within frame */
++	wr(dsi_regs, DSI_CMD_DMA, rd(dsi_regs, DSI_CMD_DMA) | (1u << 26));  /* LP, like the panel's on-commands */
++	wr(dsi_regs, DSI_CTRL, ctrl | (1u << 2) | 1u);                      /* CMD_MODE_EN | ENABLE */
++	wr(dsi_regs, DSI_INTR_CTRL, rd(dsi_regs, DSI_INTR_CTRL) | 1u);      /* clear CMD_DMA_DONE */
++	wr(dsi_regs, DSI_DMA_BASE, DSI_CMDBUF_PA);
++	wr(dsi_regs, DSI_DMA_LEN, 4);
++	wr(dsi_regs, DSI_TRIG_DMA, 1);
++	int err = ETIMEDOUT;
++	for (int i = 0; i < 200; i++) {
++		gt_sleep(1);
++		/* done: CMD_DMA_DONE latched, or the DMA engine is no longer busy */
++		if ((rd(dsi_regs, DSI_INTR_CTRL) & 1u) || (i >= 2 && !(rd(dsi_regs, DSI_STATUS0) & 2u))) {
++			err = 0;
++			break;
++		}
++	}
++	uint32_t st = rd(dsi_regs, DSI_STATUS0);
++	wr(dsi_regs, DSI_INTR_CTRL, rd(dsi_regs, DSI_INTR_CTRL) | 1u);
++	wr(dsi_regs, DSI_CTRL, ctrl);
++	wr(dsi_regs, DSI_TRIG_CTRL, trig);
++	printf("GUAMNA DSI: DCS %#04x %s (status %#x)\n", cmd, err ? "TIMEOUT" : "sent", st);
++	sum("dcs %02x %d", cmd, err);
++	return err;
++}
++
 +static uint8_t hx_cfg[0x4000];
 +
 +/* himax_mcu_firmware_update_0f + himax_zf_part_info (HX83102D, code overlay) */
@@ -328,10 +400,7 @@ index 6bd907b..e60004a 100644
 +	if (cfg_sz > sizeof(hx_cfg)) {
 +		sum("cfg %u too big", cfg_sz);
 +		return false;
- 	}
--	v = 0x10;
--	if ((err = hx_write(0x0d, &v, 1))) {
--		return err;
++	}
 +	/* part 0: main code, its CRC over itself is 0 */
 +	const uint8_t *e0 = tab;
 +	uint32_t sram0 = (uint32_t)e0[0] | (uint32_t)e0[1] << 8 | (uint32_t)e0[2] << 16 | (uint32_t)e0[3] << 24;
@@ -342,15 +411,10 @@ index 6bd907b..e60004a 100644
 +	sum("parts %u main %u cfg %u border %d", parts, sz0, cfg_sz, border);
 +	if (off0 + sz0 > fwlen || !hx_write_crc(sram0, fw + off0, sz0, 0, "main")) {
 +		return false;
- 	}
--	if ((err = hx_write(0x00, a, 4))) {
--		return err;
++	}
 +	if (!hx_write_crc(base, hx_cfg, cfg_sz, hx_sw_crc(hx_cfg, cfg_sz), "cfg")) {
 +		return false;
- 	}
--	v = 0x00;
--	if ((err = hx_write(0x0c, &v, 1))) {
--		return err;
++	}
 +	uint8_t reply = 0x66;                                   /* ovl_border_reply */
 +	if (border > 0) {
 +		const uint8_t *e = tab + border * 16;
@@ -517,7 +581,7 @@ index 6bd907b..e60004a 100644
  	gt_sleep(delay_s * 1000u);
  
  	gt.gcc = ml_io_map(GT_GCC_PA, 0x80000);
-@@ -442,18 +866,9 @@ gt_thread(__unused void *arg, __unused wait_result_t wr_)
+@@ -442,18 +930,9 @@ gt_thread(__unused void *arg, __unused wait_result_t wr_)
  		printf("GUAMNA TOUCH: MMIO map failed\n");
  		goto out;
  	}
@@ -536,7 +600,7 @@ index 6bd907b..e60004a 100644
  	gt_pin(6, 1, 0, 2);
  	gt_pin(7, 1, 0, 2);
  	gt_pin(71, 1, 0, 2);
-@@ -462,56 +877,67 @@ gt_thread(__unused void *arg, __unused wait_result_t wr_)
+@@ -462,56 +941,93 @@ gt_thread(__unused void *arg, __unused wait_result_t wr_)
  	if (!gt_se_init()) {
  		goto out;
  	}
@@ -551,7 +615,33 @@ index 6bd907b..e60004a 100644
 -		if (pass == 1) {
 -			uint32_t io = GT_PIN_RST * 0x1000u + 4u;
 -			wr(gt.tlmm, io, rd(gt.tlmm, io) & ~2u);
--			gt_sleep(20);
++	/* Found on the phone (0093 probe): chip select 0, SPI mode 3. */
++	wr(gt.se, SE_SPI_DEMUX, 0);
++	wr(gt.se, SE_SPI_CPHA, 1);
++	wr(gt.se, SE_SPI_CPOL, 1u << 2);
++	uint8_t wake = 0, id[4] = { 0 };
++	(void)hx_read(0x13, &wake, 1);
++	int e1 = hx_reg_read(0x900000d0u, id, 4);
++	printf("GUAMNA TOUCH: IC ID err %d: %02x %02x %02x\n", e1, id[3], id[2], id[1]);
++	sum("id %02x%02x%02x", id[3], id[2], id[1]);
++	if (e1 || id[3] != 0x83 || id[2] != 0x10 || id[1] != 0x2d) {
++		printf("GUAMNA TOUCH: HX83102D not found\n");
++		goto out;
++	}
++	const uint8_t *fw = gt_firmware(&fwlen);
++	if (fw == NULL) {
++		printf("GUAMNA TOUCH: no /guamna-touch firmware in the device tree\n");
++		sum("no firmware");
++		goto out;
++	}
++	int dsi = 1;
++	(void)PE_parse_boot_argn("guamnatouchdsi", &dsi, sizeof(dsi));
++	if (dsi) {
++		/* panel to sleep before the upload (vendor: early unblank) */
++		if (dsi_dcs(0x28) == ENXIO) {
++			dsi = 0;
++		} else {
+ 			gt_sleep(20);
 -			wr(gt.tlmm, io, rd(gt.tlmm, io) | 2u);
 -			gt_sleep(50);
 -			sum("reset pulse");
@@ -580,28 +670,29 @@ index 6bd907b..e60004a 100644
 -					sum("FOUND");
 -				}
 -			}
-+	/* Found on the phone (0093 probe): chip select 0, SPI mode 3. */
-+	wr(gt.se, SE_SPI_DEMUX, 0);
-+	wr(gt.se, SE_SPI_CPHA, 1);
-+	wr(gt.se, SE_SPI_CPOL, 1u << 2);
-+	uint8_t wake = 0, id[4] = { 0 };
-+	(void)hx_read(0x13, &wake, 1);
-+	int e1 = hx_reg_read(0x900000d0u, id, 4);
-+	printf("GUAMNA TOUCH: IC ID err %d: %02x %02x %02x\n", e1, id[3], id[2], id[1]);
-+	sum("id %02x%02x%02x", id[3], id[2], id[1]);
-+	if (e1 || id[3] != 0x83 || id[2] != 0x10 || id[1] != 0x2d) {
-+		printf("GUAMNA TOUCH: HX83102D not found\n");
-+		goto out;
++			(void)dsi_dcs(0x10);
++			gt_sleep(120);
+ 		}
+ 	}
+-	if (!found) {
+-		printf("GUAMNA TOUCH: HX83102D not found\n");
++	bool up = hx_upload(fw, fwlen);
++	if (dsi) {
++		/* dsi-panel-moto-hx83102d-hlt-hdplus-video on-commands: 11 (10 ms), 29 (50 ms) */
++		(void)dsi_dcs(0x11);
++		gt_sleep(120);
++		(void)dsi_dcs(0x29);
++		gt_sleep(50);
 +	}
-+	const uint8_t *fw = gt_firmware(&fwlen);
-+	if (fw == NULL) {
-+		printf("GUAMNA TOUCH: no /guamna-touch firmware in the device tree\n");
-+		sum("no firmware");
-+		goto out;
-+	}
-+	if (!hx_upload(fw, fwlen)) {
++	if (!up) {
 +		printf("GUAMNA TOUCH: firmware upload failed: %s\n", gt_sum);
 +		goto out;
++	}
++	{
++		int e = 0;
++		uint32_t sts = hx_reg_read32(0x900000a8u, &e);
++		printf("GUAMNA TOUCH: status %#x (%s)\n", sts, (sts & 0xff) == 0x05 ? "active" : "NOT active");
++		sum("sts %#x", sts);
 +	}
 +	{
 +		int e = 0;
@@ -618,17 +709,15 @@ index 6bd907b..e60004a 100644
 +		 * panel has settled (vendor resume path: reset + reload to active),
 +		 * so it recalibrates. guamnatouchrecal=0 skips, =N waits N s.
 +		 */
-+		unsigned recal = 3;
++		unsigned recal = 0;
 +		(void)PE_parse_boot_argn("guamnatouchrecal", &recal, sizeof(recal));
 +		if (recal) {
 +			gt_sleep(recal * 1000u);
 +			bool ok = hx_sense_on();
 +			printf("GUAMNA TOUCH: recalibrate (reset + reload to active) %s\n", ok ? "ok" : "FAILED");
 +			sum("recal %d", ok);
- 		}
- 	}
--	if (!found) {
--		printf("GUAMNA TOUCH: HX83102D not found\n");
++		}
++	}
 +	printf("GUAMNA TOUCH: firmware running, reading touches\n");
 +	sum("running");
 +	{
