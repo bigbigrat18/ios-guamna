@@ -1,0 +1,572 @@
+diff --git a/bsd/dev/guamna_touch.c b/bsd/dev/guamna_touch.c
+index 6bd907b..fb8747d 100644
+--- a/bsd/dev/guamna_touch.c
++++ b/bsd/dev/guamna_touch.c
+@@ -27,6 +27,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+ #include <kern/debug.h>
+ 
+@@ -374,20 +375,28 @@ gt_xfer(const uint8_t *tx, uint8_t *rx, unsigned len, bool frag)
+ 	return ETIMEDOUT;
+ }
+ 
+-/* Himax bus write: F2 cmd data... */
++/* Himax bus write: F2 cmd data... (data up to HX_CHUNK + 4 bytes) */
++#define HX_CHUNK        2048u
++static uint8_t hx_txbuf[HX_CHUNK + 16];
++
+ static int
+ hx_write(uint8_t cmd, const uint8_t *data, unsigned n)
+ {
+-	uint8_t buf[16];
+-	if (n > sizeof(buf) - 2) {
++	if (n > sizeof(hx_txbuf) - 2) {
+ 		return EINVAL;
+ 	}
+-	buf[0] = 0xf2;
+-	buf[1] = cmd;
++	hx_txbuf[0] = 0xf2;
++	hx_txbuf[1] = cmd;
+ 	for (unsigned i = 0; i < n; i++) {
+-		buf[2 + i] = data[i];
++		hx_txbuf[2 + i] = data[i];
+ 	}
+-	return gt_xfer(buf, NULL, n + 2, false);
++	return gt_xfer(hx_txbuf, NULL, n + 2, false);
++}
++
++static int
++hx_write1(uint8_t cmd, uint8_t v)
++{
++	return hx_write(cmd, &v, 1);
+ }
+ 
+ /* Himax bus read: F3 cmd 00, then n bytes, one CS assertion. */
+@@ -402,37 +411,398 @@ hx_read(uint8_t cmd, uint8_t *data, unsigned n)
+ 	return err;
+ }
+ 
+-/* AHB register read, 4 bytes (vendor himax_mcu_register_read, burst off). */
++/* burst mode: 0x13 = 0x31 (continuous), 0x0D = 0x10 | auto-increment-4 */
++static int
++hx_burst(bool incr4)
++{
++	int err = hx_write1(0x13, 0x31);
++	if (!err) {
++		err = hx_write1(0x0d, (uint8_t)(0x10 | (incr4 ? 1 : 0)));
++	}
++	return err;
++}
++
++/* AHB register read (vendor himax_mcu_register_read). */
+ static int
+-hx_reg_read(uint32_t addr, uint8_t out[4])
++hx_reg_read(uint32_t addr, uint8_t *out, unsigned n)
+ {
+-	uint8_t v;
+ 	uint8_t a[4] = { (uint8_t)addr, (uint8_t)(addr >> 8), (uint8_t)(addr >> 16), (uint8_t)(addr >> 24) };
+-	int err;
+-	v = 0x31;
+-	if ((err = hx_write(0x13, &v, 1))) {
+-		return err;
++	int err = hx_burst(n > 4);
++	if (!err) {
++		err = hx_write(0x00, a, 4);
++	}
++	if (!err) {
++		err = hx_write1(0x0c, 0x00);
+ 	}
+-	v = 0x10;
+-	if ((err = hx_write(0x0d, &v, 1))) {
+-		return err;
++	if (!err) {
++		err = hx_read(0x08, out, n);
+ 	}
+-	if ((err = hx_write(0x00, a, 4))) {
+-		return err;
++	if (n > 4) {
++		(void)hx_burst(false);
+ 	}
+-	v = 0x00;
+-	if ((err = hx_write(0x0c, &v, 1))) {
+-		return err;
++	return err;
++}
++
++static uint32_t
++hx_reg_read32(uint32_t addr, int *errp)
++{
++	uint8_t b[4] = { 0 };
++	int err = hx_reg_read(addr, b, 4);
++	if (errp && err) {
++		*errp = err;
++	}
++	return (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++}
++
++/* AHB register / SRAM write (vendor himax_mcu_register_write), chunked. */
++static int
++hx_reg_write(uint32_t addr, const uint8_t *data, unsigned n)
++{
++	static uint8_t buf[HX_CHUNK + 4];
++	int err = hx_burst(n > 4);
++	for (unsigned done = 0; !err && done < n;) {
++		unsigned c = n - done > HX_CHUNK ? HX_CHUNK : n - done;
++		uint32_t a = addr + done;
++		buf[0] = (uint8_t)a;
++		buf[1] = (uint8_t)(a >> 8);
++		buf[2] = (uint8_t)(a >> 16);
++		buf[3] = (uint8_t)(a >> 24);
++		memcpy(buf + 4, data + done, c);
++		err = hx_write(0x00, buf, c + 4);
++		done += c;
++		delay(100);
++	}
++	return err;
++}
++
++static int
++hx_reg_write32(uint32_t addr, uint32_t v)
++{
++	uint8_t b[4] = { (uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24) };
++	return hx_reg_write(addr, b, 4);
++}
++
++/* Hardware CRC of an SRAM range (vendor himax_mcu_check_CRC). */
++static uint32_t
++hx_hw_crc(uint32_t addr, unsigned len)
++{
++	unsigned words = len / 4;
++	int err = hx_reg_write32(0x80050020u, addr);
++	if (!err) {
++		err = hx_reg_write32(0x80050028u, 0x00990000u | (words & 0xffffu));
++	}
++	for (int i = 0; !err && i < 100; i++) {
++		uint32_t st = hx_reg_read32(0x80050000u, &err);
++		if (!(st & 1u)) {
++			return hx_reg_read32(0x80050018u, &err);
++		}
++		gt_sleep(1);
++	}
++	return 0xffffffffu;     /* never a valid answer below */
++}
++
++/* Software CRC (vendor himax_mcu_Calculate_CRC_with_AP). */
++static uint32_t
++hx_sw_crc(const uint8_t *p, unsigned len)
++{
++	uint32_t crc = 0xffffffffu;
++	for (unsigned i = 0; i + 4 <= len; i += 4) {
++		uint32_t w = (uint32_t)p[i] | (uint32_t)p[i + 1] << 8 | (uint32_t)p[i + 2] << 16 | (uint32_t)p[i + 3] << 24;
++		crc ^= w;
++		for (int j = 0; j < 32; j++) {
++			crc = (crc & 1u) ? ((crc >> 1) & 0x7fffffffu) ^ 0x82f63b78u : (crc >> 1) & 0x7fffffffu;
++		}
++	}
++	return crc;
++}
++
++/* Write a part and check the hardware CRC (0 = image carries its own CRC). */
++static bool
++hx_write_crc(uint32_t addr, const uint8_t *data, unsigned len, uint32_t want, const char *what)
++{
++	uint32_t crc = 0;
++	for (int retry = 0; retry < 3; retry++) {
++		if (hx_reg_write(addr, data, len)) {
++			continue;
++		}
++		crc = hx_hw_crc(addr, len);
++		if (crc == want) {
++			printf("GUAMNA TOUCH: %s %u bytes at %#x CRC ok\n", what, len, addr);
++			return true;
++		}
++	}
++	printf("GUAMNA TOUCH: %s CRC fail hw %#x want %#x\n", what, crc, want);
++	sum("%s crc %#x/%#x", what, crc, want);
++	return false;
++}
++
++static void
++gt_reset_pulse(void)
++{
++	uint32_t io = GT_PIN_RST * 0x1000u + 4u;
++	wr(gt.tlmm, io, rd(gt.tlmm, io) & ~2u);
++	gt_sleep(20);
++	wr(gt.tlmm, io, rd(gt.tlmm, io) | 2u);
++	gt_sleep(50);
++}
++
++/* hx83102d_sense_off(false): stop the touch MCU, enter safe mode, reset TCON/ADC. */
++static bool
++hx_sense_off(void)
++{
++	int err = 0;
++	(void)hx_reg_write32(0x9000005cu, 0xa5);                /* fw stop */
++	gt_sleep(10);
++	(void)hx_reg_read32(0x900000a8u, &err);
++	for (int cnt = 0; cnt <= 5; cnt++) {
++		(void)hx_write1(0x31, 0x27);                    /* safe-mode password */
++		(void)hx_write1(0x32, 0x95);
++		uint32_t st = hx_reg_read32(0x900000a8u, &err);
++		if ((st & 0xff) == 0x0c) {
++			(void)hx_reg_write32(0x80020020u, 0);   /* reset TCON */
++			gt_sleep(1);
++			(void)hx_reg_write32(0x80020020u, 1);
++			(void)hx_reg_write32(0x80020094u, 0);   /* reset ADC */
++			gt_sleep(1);
++			(void)hx_reg_write32(0x80020094u, 1);
++			return true;
++		}
++		printf("GUAMNA TOUCH: sense off: state %#x, retry %d\n", st, cnt);
++		gt_sleep(5);
++		gt_reset_pulse();
++	}
++	sum("sense off fail");
++	return false;
++}
++
++/* hx83102d_sense_on(0): interface on, clear fw stop, reset, reload to active. */
++static bool
++hx_sense_on(void)
++{
++	uint8_t d[4];
++	int err = 0;
++	(void)hx_read(0x08, d, 4);                              /* knock */
++	for (int i = 0; i < 10; i++) {
++		uint8_t a = 0, b = 0;
++		(void)hx_burst(false);
++		(void)hx_read(0x13, &a, 1);
++		(void)hx_read(0x0d, &b, 1);
++		if (a == 0x31 && b == 0x10) {
++			break;
++		}
++		gt_sleep(1);
++	}
++	(void)hx_reg_write32(0x9000005cu, 0);
++	gt_sleep(10);
++	gt_reset_pulse();
++	for (int i = 0; i < 5; i++) {
++		(void)hx_reg_write32(0x90000048u, 0xec);
++		gt_sleep(1);
++		uint32_t v = hx_reg_read32(0x90000048u, &err);
++		if ((v & 0xffff) == 0x01ec) {
++			return true;
++		}
++	}
++	sum("reload to active fail");
++	return false;
++}
++
++static const uint8_t *
++gt_firmware(unsigned *len)
++{
++	DTEntry node;
++	void const *p = NULL;
++	unsigned int size = 0;
++	if (SecureDTLookupEntry(NULL, "/guamna-touch", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "firmware", &p, &size) != kSuccess || size < 0x10100) {
++		return NULL;
++	}
++	*len = size;
++	return (const uint8_t *)p;
++}
++
++static uint8_t hx_cfg[0x4000];
++
++/* himax_mcu_firmware_update_0f + himax_zf_part_info (HX83102D, code overlay) */
++static bool
++hx_upload(const uint8_t *fw, unsigned fwlen)
++{
++	const uint8_t *tab = fw + 0x10000;
++	unsigned parts = tab[12];
++	uint32_t base = 0xffffffffu, top = 0;
++	unsigned top_sz = 0;
++	int border = -1;
++
++	if (parts < 2 || parts > 32 || 0x10000 + parts * 16 > fwlen) {
++		sum("bad part table %u", parts);
++		return false;
++	}
++	(void)hx_reg_write32(0x90000018u, 0x55);                /* system reset */
++	if (!hx_sense_off()) {
++		return false;
++	}
++	memset(hx_cfg, 0, sizeof(hx_cfg));
++	for (unsigned pass = 0; pass < 2; pass++) {
++		for (unsigned i = 1; i < parts; i++) {
++			const uint8_t *e = tab + i * 16;
++			uint32_t sram = (uint32_t)e[0] | (uint32_t)e[1] << 8 | (uint32_t)e[2] << 16 | (uint32_t)e[3] << 24;
++			uint32_t sz = (uint32_t)e[4] | (uint32_t)e[5] << 8 | (uint32_t)e[6] << 16 | (uint32_t)e[7] << 24;
++			uint32_t off = (uint32_t)e[8] | (uint32_t)e[9] << 8 | (uint32_t)e[10] << 16 | (uint32_t)e[11] << 24;
++			bool ovl = (e[15] == 0x55 && e[14] == 0x66) || sram == 0x20008ce0u;
++			if (ovl) {
++				if (pass == 0 && e[15] == 0x55 && e[14] == 0x66 && e[13] == 2) {
++					border = (int)i;
++				}
++				continue;
++			}
++			if (off + sz > fwlen) {
++				sum("part %u out of file", i);
++				return false;
++			}
++			if (pass == 0) {
++				if (sram < base) {
++					base = sram;
++				}
++				if (sram >= top) {
++					top = sram;
++					top_sz = sz;
++				}
++			} else {
++				uint32_t a = sram & ~3u;
++				if (a < base || a - base + sz > sizeof(hx_cfg)) {
++					sum("cfg part %u too big", i);
++					return false;
++				}
++				memcpy(hx_cfg + (a - base), fw + off, sz);
++			}
++		}
++	}
++	unsigned cfg_sz = top - base + top_sz;
++	cfg_sz = (cfg_sz + 15u) & ~15u;
++	if (cfg_sz > sizeof(hx_cfg)) {
++		sum("cfg %u too big", cfg_sz);
++		return false;
++	}
++	/* part 0: main code, its CRC over itself is 0 */
++	const uint8_t *e0 = tab;
++	uint32_t sram0 = (uint32_t)e0[0] | (uint32_t)e0[1] << 8 | (uint32_t)e0[2] << 16 | (uint32_t)e0[3] << 24;
++	uint32_t sz0 = (uint32_t)e0[4] | (uint32_t)e0[5] << 8 | (uint32_t)e0[6] << 16 | (uint32_t)e0[7] << 24;
++	uint32_t off0 = (uint32_t)e0[8] | (uint32_t)e0[9] << 8 | (uint32_t)e0[10] << 16 | (uint32_t)e0[11] << 24;
++	printf("GUAMNA TOUCH: fw %u bytes, %u parts, main %u at %#x, cfg %u at %#x, border part %d\n",
++	    fwlen, parts, sz0, sram0, cfg_sz, base, border);
++	sum("parts %u main %u cfg %u border %d", parts, sz0, cfg_sz, border);
++	if (off0 + sz0 > fwlen || !hx_write_crc(sram0, fw + off0, sz0, 0, "main")) {
++		return false;
++	}
++	if (!hx_write_crc(base, hx_cfg, cfg_sz, hx_sw_crc(hx_cfg, cfg_sz), "cfg")) {
++		return false;
++	}
++	uint8_t reply = 0x66;                                   /* ovl_border_reply */
++	if (border > 0) {
++		const uint8_t *e = tab + border * 16;
++		uint32_t sram = (uint32_t)e[0] | (uint32_t)e[1] << 8 | (uint32_t)e[2] << 16 | (uint32_t)e[3] << 24;
++		uint32_t sz = (uint32_t)e[4] | (uint32_t)e[5] << 8 | (uint32_t)e[6] << 16 | (uint32_t)e[7] << 24;
++		uint32_t off = (uint32_t)e[8] | (uint32_t)e[9] << 8 | (uint32_t)e[10] << 16 | (uint32_t)e[11] << 24;
++		if (!sz || off + sz > fwlen || !hx_write_crc(sram, fw + off, sz, 0, "border")) {
++			reply = 0xff;                           /* ovl_fault */
++		}
++	} else {
++		reply = 0xff;
++	}
++	for (int i = 0; i < 5; i++) {
++		int err = 0;
++		(void)hx_reg_write32(0x10007ffcu, reply);       /* overlay handshake */
++		if (hx_reg_read32(0x10007ffcu, &err) == reply) {
++			break;
++		}
++	}
++	(void)hx_reg_write32(0x10007294u, 1);                   /* set frame */
++	(void)hx_reg_write32(0x10007f00u, 0);                   /* flash reload enable (vendor reload_disable(0)) */
++	return hx_sense_on();
++}
++
++/* Panel (720x1600) -> sweet_hid_touch coordinates (1080x2400 panel inside 1125x2436). */
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++
++static void
++gt_report(int id, bool down, int px, int py)
++{
++	/* AppleCLCD shows the 1125x2436 canvas as 720x1559 at y 20 (0092). */
++	int lx = px * 1125 / 720;
++	int ly = (py - 20) * 2436 / 1559;
++	sweet_hid_touch(id, down ? 1 : 0, lx - (1125 - 1080) / 2, ly - (2436 - 2400) / 2);
++}
++
++#define HX_MAX_PT       10
++#define HX_INFO_SZ      56      /* (10 + 2 + 2) * 4 */
++#define HX_PT_CNT       52      /* 10 * 4 coords + 12 area */
++
++static void
++gt_events(void)
++{
++	uint8_t buf[HX_INFO_SZ];
++	int x[HX_MAX_PT] = { 0 }, y[HX_MAX_PT] = { 0 };
++	uint32_t active = 0;
++	unsigned logged = 0, errors = 0;
++
++	for (;;) {
++		bool irq = !(rd(gt.tlmm, GT_PIN_IRQ * 0x1000u + 4u) & 1u);   /* INT is active low */
++		if (!irq && !active) {
++			gt_sleep(8);
++			continue;
++		}
++		int err = hx_write1(0x11, 0x00);                        /* AHB burst read off */
++		if (!err) {
++			err = hx_read(0x30, buf, sizeof(buf));
++		}
++		(void)hx_write1(0x11, 0x01);
++		if (err) {
++			if (errors++ < 5) {
++				printf("GUAMNA TOUCH: event read err %d\n", err);
++			}
++			gt_sleep(20);
++			continue;
++		}
++		uint32_t mask = 0;
++		int nx[HX_MAX_PT] = { 0 }, ny[HX_MAX_PT] = { 0 };
++		if (buf[HX_PT_CNT] != 0xff) {
++			for (int i = 0; i < HX_MAX_PT; i++) {
++				int px = buf[4 * i] << 8 | buf[4 * i + 1];
++				int py = buf[4 * i + 2] << 8 | buf[4 * i + 3];
++				if (px <= 720 && py <= 1600) {
++					mask |= 1u << i;
++					nx[i] = px;
++					ny[i] = py;
++				}
++			}
++		}
++		if (logged < 12 && (mask || active)) {
++			logged++;
++			printf("GUAMNA TOUCH: event cnt %#x mask %#x p0 %d,%d\n", buf[HX_PT_CNT], mask, nx[0], ny[0]);
++		}
++		for (int i = 0; i < HX_MAX_PT; i++) {
++			uint32_t bit = 1u << i;
++			if (mask & bit) {
++				if (!(active & bit) || nx[i] != x[i] || ny[i] != y[i]) {
++					gt_report(i, true, nx[i], ny[i]);
++				}
++				x[i] = nx[i];
++				y[i] = ny[i];
++			} else if (active & bit) {
++				gt_report(i, false, x[i], y[i]);
++			}
++		}
++		active = mask;
++		gt_sleep(active ? 10 : 2);
+ 	}
+-	return hx_read(0x08, out, 4);
+ }
+ 
+ static void
+ gt_thread(__unused void *arg, __unused wait_result_t wr_)
+ {
+-	unsigned delay_s = 5;
++	unsigned delay_s = 5, fwlen = 0;
+ 	(void)PE_parse_boot_argn("guamnatouchdelay", &delay_s, sizeof(delay_s));
+-	printf("GUAMNA TOUCH: probe in %u s\n", delay_s);
++	printf("GUAMNA TOUCH: start in %u s\n", delay_s);
+ 	gt_sleep(delay_s * 1000u);
+ 
+ 	gt.gcc = ml_io_map(GT_GCC_PA, 0x80000);
+@@ -442,18 +812,9 @@ gt_thread(__unused void *arg, __unused wait_result_t wr_)
+ 		printf("GUAMNA TOUCH: MMIO map failed\n");
+ 		goto out;
+ 	}
+-	sum("pins %#x %#x %#x %#x irq %#x rst %#x", rd(gt.tlmm, 6 * 0x1000u), rd(gt.tlmm, 7 * 0x1000u),
+-	    rd(gt.tlmm, 71 * 0x1000u), rd(gt.tlmm, 80 * 0x1000u), rd(gt.tlmm, GT_PIN_IRQ * 0x1000u),
+-	    rd(gt.tlmm, GT_PIN_RST * 0x1000u));
+-	printf("GUAMNA TOUCH: pins 6 %#x 7 %#x 71 %#x 80 %#x irq67 %#x/%#x rst66 %#x/%#x\n",
+-	    rd(gt.tlmm, 6 * 0x1000u), rd(gt.tlmm, 7 * 0x1000u), rd(gt.tlmm, 71 * 0x1000u),
+-	    rd(gt.tlmm, 80 * 0x1000u), rd(gt.tlmm, GT_PIN_IRQ * 0x1000u),
+-	    rd(gt.tlmm, GT_PIN_IRQ * 0x1000u + 4u), rd(gt.tlmm, GT_PIN_RST * 0x1000u),
+-	    rd(gt.tlmm, GT_PIN_RST * 0x1000u + 4u));
+ 	if (!gt_clocks()) {
+ 		goto out;
+ 	}
+-	/* qup2 = mux 1, 6 mA (drive field 2), no pull; IRQ pin input pull-up */
+ 	gt_pin(6, 1, 0, 2);
+ 	gt_pin(7, 1, 0, 2);
+ 	gt_pin(71, 1, 0, 2);
+@@ -462,56 +823,43 @@ gt_thread(__unused void *arg, __unused wait_result_t wr_)
+ 	if (!gt_se_init()) {
+ 		goto out;
+ 	}
+-	/*
+-	 * First probe (cs 3, mode 1) read all 0xff: nobody drives MISO. Try
+-	 * every chip select and the SPI modes, then the same after a touch
+-	 * reset pulse (vendor hx83102_pin_reset: low 20 ms, high 50 ms).
+-	 */
+-	static const uint8_t modes[3][2] = { { 1, 0 }, { 1, 1 }, { 0, 0 } };   /* cpha, cpol */
+-	bool found = false;
+-	for (unsigned pass = 0; pass < 2 && !found && !gt.dead; pass++) {
+-		if (pass == 1) {
+-			uint32_t io = GT_PIN_RST * 0x1000u + 4u;
+-			wr(gt.tlmm, io, rd(gt.tlmm, io) & ~2u);
+-			gt_sleep(20);
+-			wr(gt.tlmm, io, rd(gt.tlmm, io) | 2u);
+-			gt_sleep(50);
+-			sum("reset pulse");
+-		}
+-		for (unsigned cs = 0; cs < 4 && !found && !gt.dead; cs++) {
+-			for (unsigned m = 0; m < 3 && !found && !gt.dead; m++) {
+-				uint8_t wake = 0, id[4] = { 0 };
+-				wr(gt.se, SE_SPI_DEMUX, (cs + GT_CS) & 3u);      /* 3 first */
+-				wr(gt.se, SE_SPI_CPHA, modes[m][0]);
+-				wr(gt.se, SE_SPI_CPOL, modes[m][1] ? (1u << 2) : 0);
+-				int e0 = hx_read(0x13, &wake, 1);
+-				int e1 = hx_reg_read(0x900000d0u, id);
+-				printf("GUAMNA TOUCH: pass %u cs %u cpha %u cpol %u: wake %d %#x id %d %02x %02x %02x %02x\n",
+-				    pass, (cs + GT_CS) & 3u, modes[m][0], modes[m][1], e0, wake, e1,
+-				    id[3], id[2], id[1], id[0]);
+-				bool ff = id[0] == 0xff && id[1] == 0xff && id[2] == 0xff && id[3] == 0xff && wake == 0xff;
+-				bool zero = !id[0] && !id[1] && !id[2] && !id[3] && !wake;
+-				if (!(ff || zero) || m == 0) {
+-					sum("p%u c%u m%u %d/%d %02x %02x%02x%02x%02x", pass, (cs + GT_CS) & 3u, m,
+-					    e0, e1, wake, id[3], id[2], id[1], id[0]);
+-				}
+-				if (!e1 && id[3] == 0x83 && id[2] == 0x10) {
+-					found = true;
+-					printf("GUAMNA TOUCH: found HX8310%02x (pass %u cs %u mode %u)\n",
+-					    id[1], pass, (cs + GT_CS) & 3u, m);
+-					sum("FOUND");
+-				}
+-			}
+-		}
+-	}
+-	if (!found) {
++	/* Found on the phone (0093 probe): chip select 0, SPI mode 3. */
++	wr(gt.se, SE_SPI_DEMUX, 0);
++	wr(gt.se, SE_SPI_CPHA, 1);
++	wr(gt.se, SE_SPI_CPOL, 1u << 2);
++	uint8_t wake = 0, id[4] = { 0 };
++	(void)hx_read(0x13, &wake, 1);
++	int e1 = hx_reg_read(0x900000d0u, id, 4);
++	printf("GUAMNA TOUCH: IC ID err %d: %02x %02x %02x\n", e1, id[3], id[2], id[1]);
++	sum("id %02x%02x%02x", id[3], id[2], id[1]);
++	if (e1 || id[3] != 0x83 || id[2] != 0x10 || id[1] != 0x2d) {
+ 		printf("GUAMNA TOUCH: HX83102D not found\n");
++		goto out;
++	}
++	const uint8_t *fw = gt_firmware(&fwlen);
++	if (fw == NULL) {
++		printf("GUAMNA TOUCH: no /guamna-touch firmware in the device tree\n");
++		sum("no firmware");
++		goto out;
++	}
++	if (!hx_upload(fw, fwlen)) {
++		printf("GUAMNA TOUCH: firmware upload failed: %s\n", gt_sum);
++		goto out;
++	}
++	printf("GUAMNA TOUCH: firmware running, reading touches\n");
++	sum("running");
++	{
++		int stop = 0;
++		if (PE_parse_boot_argn("guamnatouchpanic", &stop, sizeof(stop)) && stop) {
++			panic("GUAMNA TOUCH: %s", gt_sum);
++		}
+ 	}
++	gt_events();
+ out:
+ 	{
+ 		int stop = 0;
+ 		if (PE_parse_boot_argn("guamnatouchpanic", &stop, sizeof(stop)) && stop) {
+-			panic("GUAMNA TOUCH probe: %s", gt_sum);
++			panic("GUAMNA TOUCH: %s", gt_sum);
+ 		}
+ 	}
+ 	(void)thread_terminate(current_thread());

@@ -141,6 +141,14 @@ jobs:
           name: xnu-kernel-guamna
           path: xnu/out
 
+      - name: Himax touch firmware (Motorola file, pinned; never committed)
+        if: inputs.payload == 'kernel'
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/hlt_Himax_firmware.bin" \
+            "https://raw.githubusercontent.com/TheMuppets/proprietary_vendor_motorola_guamna/dc00c2acabd4b22af92a8346f9353c1e0503c1a5/proprietary/vendor/firmware/hlt_Himax_firmware.bin"
+          echo "17bffc3195d87a2dd05b7b10ffb060fa1f9c548f46b4d5fab15bd140568e6f5f  $RUNNER_TEMP/hlt_Himax_firmware.bin" | sha256sum -c -
+          echo "GUAMNA_TOUCH_FW=$RUNNER_TEMP/hlt_Himax_firmware.bin" >> "$GITHUB_ENV"
+
       - name: XNU payload (payload=kernel)
         if: inputs.payload == 'kernel'
         run: |

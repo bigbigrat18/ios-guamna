@@ -409,6 +409,12 @@ def build_guamna(seed=None):
                       ('guamna-usb-qusb2', 'usb_qusb2')):
         if g[key] is not None:
             hw.append(node(name, [ph(), ('reg', reg(g[key]))]))
+    # Himax HX83102D zero-flash touch firmware (bsd/dev/guamna_touch.c uploads
+    # it over SPI). Motorola's file: CI downloads it, it never goes into git.
+    touch_fw = os.environ.get('GUAMNA_TOUCH_FW')
+    if touch_fw:
+        hw.append(node('guamna-touch', [ph(), ('compatible', cstr('himax,hx83102d')),
+                                        ('firmware', open(touch_fw, 'rb').read())]))
     if None not in (g['spmi_core'], g['spmi_obsrvr'], g['spmi_cnfg']):
         hw.append(node('guamna-spmi', [ph(), ('compatible', cstr('qcom,spmi-pmic-arb')),
                                        ('reg', reg(g['spmi_core']) + reg(g['spmi_obsrvr']) +
